@@ -17,25 +17,118 @@ from torchvision import transforms as T
 from transformers import AutoImageProcessor, Dinov2Model
 from tqdm import tqdm
 
-import json
-from pathlib import Path
-from typing import List, Dict, Optional, Sequence, Union
+from typing import List, Dict
+import random
 
 import numpy as np
-from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
+from PIL import Image, ImageOps
+from torchvision import transforms as T
+from transformers import AutoImageProcessor
+
+
+def safe_expand_bbox_xywh(
+    bbox,
+    img_w: int,
+    img_h: int,
+    expand_ratio: float = 0.15,
+    min_crop_size: int = 8,
+):
+    """
+    bbox: [x, y, w, h]
+    returns integer xyxy box, clamped to image bounds, with minimum size enforced
+    """
+    x, y, w, h = bbox
+    x = float(x)
+    y = float(y)
+    w = float(w)
+    h = float(h)
+
+    if w <= 0 or h <= 0:
+        raise ValueError(f"Invalid bbox with non-positive size: {bbox}")
+
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+
+    new_w = max(w * (1.0 + 2.0 * expand_ratio), float(min_crop_size))
+    new_h = max(h * (1.0 + 2.0 * expand_ratio), float(min_crop_size))
+
+    x1 = int(np.floor(cx - new_w / 2.0))
+    y1 = int(np.floor(cy - new_h / 2.0))
+    x2 = int(np.ceil(cx + new_w / 2.0))
+    y2 = int(np.ceil(cy + new_h / 2.0))
+
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(img_w, x2)
+    y2 = min(img_h, y2)
+
+    # Enforce minimum crop size again after clamping
+    cur_w = x2 - x1
+    cur_h = y2 - y1
+
+    if cur_w < min_crop_size:
+        deficit = min_crop_size - cur_w
+        left_add = deficit // 2
+        right_add = deficit - left_add
+        x1 = max(0, x1 - left_add)
+        x2 = min(img_w, x2 + right_add)
+
+    if cur_h < min_crop_size:
+        deficit = min_crop_size - cur_h
+        top_add = deficit // 2
+        bot_add = deficit - top_add
+        y1 = max(0, y1 - top_add)
+        y2 = min(img_h, y2 + bot_add)
+
+    # Final fallback in case image itself is tiny / edge case
+    if x2 <= x1:
+        x1 = max(0, min(x1, img_w - 1))
+        x2 = min(img_w, x1 + max(1, min_crop_size))
+    if y2 <= y1:
+        y1 = max(0, min(y1, img_h - 1))
+        y2 = min(img_h, y1 + max(1, min_crop_size))
+
+    return int(x1), int(y1), int(x2), int(y2)
+
+
+class ResizeKeepAspectPad:
+    def __init__(self, size=224, fill=(0, 0, 0), interpolation=Image.BICUBIC):
+        self.size = int(size)
+        self.fill = fill
+        self.interpolation = interpolation
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Invalid crop size: {img.size}")
+
+        scale = min(self.size / w, self.size / h)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+
+        img = img.resize((new_w, new_h), resample=self.interpolation)
+
+        pad_w = self.size - new_w
+        pad_h = self.size - new_h
+
+        left = pad_w // 2
+        right = pad_w - left
+        top = pad_h // 2
+        bottom = pad_h - top
+
+        return ImageOps.expand(img, border=(left, top, right, bottom), fill=self.fill)
 
 
 class SafeGaussianBlur:
-    def __init__(self, kernel_size=3, sigma=(0.1, 2.0), p=0.2, min_side=8):
-        self.blur = transforms.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
+    def __init__(self, kernel_size=3, sigma=(0.1, 1.5), p=0.2, min_side=8):
+        self.blur = T.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
         self.p = p
         self.min_side = min_side
 
     def __call__(self, img: Image.Image) -> Image.Image:
-        if np.random.rand() > self.p:
+        if random.random() > self.p:
             return img
         w, h = img.size
         if min(w, h) < self.min_side:
@@ -44,209 +137,118 @@ class SafeGaussianBlur:
 
 
 class BinaryCocoCropDataset(Dataset):
-    """
-    Binary dataset built from two COCO annotation files:
-      - positive_json: all annotations are label=1
-      - negative_json: all annotations are label=0
-
-    Ignores category ids.
-
-    Returns:
-      {
-        "pixel_values": Tensor [3, H, W],
-        "label": Tensor scalar {0,1},
-        "image_id": int,
-        "annotation_id": int,
-        "file_name": str,
-        "bbox_xywh": [x, y, w, h],
-      }
-    """
-
     def __init__(
         self,
-        positive_json: Optional[Union[str, Path]],
-        negative_json: Optional[Union[str, Path]],
-        image_roots: Union[str, Path, Sequence[Union[str, Path]]],
-        image_size: int = 224,
+        records: List[Dict],
+        processor: AutoImageProcessor,
+        train: bool = True,
         bbox_expand_ratio: float = 0.15,
         min_crop_size: int = 8,
-        training: bool = True,
-        normalize_mean=(0.485, 0.456, 0.406),
-        normalize_std=(0.229, 0.224, 0.225),
+        use_vertical_flip: bool = False,
+        use_affine: bool = False,
     ):
-        self.image_roots = [Path(p) for p in ([image_roots] if isinstance(image_roots, (str, Path)) else image_roots)]
-        self.image_size = image_size
+        self.records = records
+        self.processor = processor
+        self.train = train
         self.bbox_expand_ratio = bbox_expand_ratio
         self.min_crop_size = min_crop_size
-        self.training = training
 
-        self.samples: List[Dict] = []
-        self._missing_images = set()
+        # Robustly parse processor size
+        size = getattr(processor, "size", {"height": 224, "width": 224})
+        if isinstance(size, dict):
+            if "shortest_edge" in size:
+                resize_size = int(size["shortest_edge"])
+            elif "height" in size and "width" in size:
+                # Use square target for pad-to-size pipeline
+                resize_size = int(max(size["height"], size["width"]))
+            else:
+                resize_size = 224
+        else:
+            resize_size = 224
 
-        if positive_json is not None:
-            self.samples.extend(self._load_coco_as_binary(positive_json, label=1))
-        if negative_json is not None:
-            self.samples.extend(self._load_coco_as_binary(negative_json, label=0))
+        image_mean = getattr(processor, "image_mean", [0.485, 0.456, 0.406])
+        image_std = getattr(processor, "image_std", [0.229, 0.224, 0.225])
 
-        if len(self.samples) == 0:
-            raise RuntimeError("No valid samples found in the provided COCO json files.")
+        if len(image_mean) != 3:
+            image_mean = [0.485, 0.456, 0.406]
+        if len(image_std) != 3:
+            image_std = [0.229, 0.224, 0.225]
 
-        if training:
-            self.transform = transforms.Compose([
-                transforms.RandomApply([
-                    transforms.ColorJitter(
+        aug_list = []
+
+        if train:
+            if use_affine:
+                # Mild affine only; keep optional because it can hurt bbox-crop semantics
+                aug_list.append(
+                    T.RandomAffine(
+                        degrees=8,
+                        translate=(0.05, 0.05),
+                        scale=(0.9, 1.1),
+                        fill=0,
+                    )
+                )
+
+            aug_list.extend([
+                T.RandomHorizontalFlip(p=0.5),
+            ])
+
+            if use_vertical_flip:
+                aug_list.append(T.RandomVerticalFlip(p=0.5))
+
+            aug_list.extend([
+                T.RandomApply([
+                    T.ColorJitter(
                         brightness=0.25,
                         contrast=0.25,
                         saturation=0.20,
                         hue=0.05,
                     )
                 ], p=0.8),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-                SafeGaussianBlur(kernel_size=3, sigma=(0.1, 1.5), p=0.2, min_side=max(8, min_crop_size)),
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=normalize_mean, std=normalize_std),
-            ])
-        else:
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=normalize_mean, std=normalize_std),
+                SafeGaussianBlur(
+                    kernel_size=3,
+                    sigma=(0.1, 1.5),
+                    p=0.2,
+                    min_side=max(8, min_crop_size),
+                ),
             ])
 
-    def __len__(self):
-        return len(self.samples)
+        aug_list.extend([
+            ResizeKeepAspectPad(size=resize_size, fill=(0, 0, 0)),
+            T.ToTensor(),
+            T.Normalize(mean=image_mean, std=image_std),
+        ])
+
+        self.aug = T.Compose(aug_list)
+
+    def __len__(self) -> int:
+        return len(self.records)
 
     def __getitem__(self, idx: int):
-        sample = self.samples[idx]
+        rec = self.records[idx]
 
-        img_path = sample["img_path"]
-        with Image.open(img_path) as img:
-            img = img.convert("RGB")
-            x1, y1, x2, y2 = self._expanded_xyxy_from_xywh(
-                bbox_xywh=sample["bbox_xywh"],
-                img_w=img.width,
-                img_h=img.height,
-                expand_ratio=self.bbox_expand_ratio,
-                min_crop_size=self.min_crop_size,
-            )
+        img = Image.open(rec["image_path"]).convert("RGB")
+        img_w, img_h = img.size
 
-            crop = img.crop((x1, y1, x2, y2)).convert("RGB")
-            pixel_values = self.transform(crop)
+        x1, y1, x2, y2 = safe_expand_bbox_xywh(
+            rec["bbox"],
+            img_w=img_w,
+            img_h=img_h,
+            expand_ratio=self.bbox_expand_ratio,
+            min_crop_size=self.min_crop_size,
+        )
 
-        return {
-            "pixel_values": pixel_values,
-            "label": torch.tensor(sample["label"], dtype=torch.long),
-            "image_id": sample["image_id"],
-            "annotation_id": sample["annotation_id"],
-            "file_name": sample["file_name"],
-            "bbox_xywh": torch.tensor(sample["bbox_xywh"], dtype=torch.float32),
+        crop = img.crop((x1, y1, x2, y2)).convert("RGB")
+        pixel_values = self.aug(crop)
+
+        meta = {
+            "image_id": rec["image_id"],
+            "annotation_id": rec["annotation_id"],
+            "file_name": rec["file_name"],
+            "bbox": rec["bbox"],
+            "crop_xyxy": [x1, y1, x2, y2],
         }
 
-    def _load_coco_as_binary(self, coco_json: Union[str, Path], label: int) -> List[Dict]:
-        coco_json = Path(coco_json)
-        with open(coco_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        images = {img["id"]: img for img in data.get("images", [])}
-        annotations = data.get("annotations", [])
-
-        loaded_samples = []
-
-        for ann in annotations:
-            image_id = ann.get("image_id")
-            if image_id not in images:
-                continue
-
-            img_info = images[image_id]
-            file_name = img_info.get("file_name")
-            if file_name is None:
-                continue
-
-            bbox = ann.get("bbox", None)
-            if bbox is None or len(bbox) != 4:
-                continue
-
-            x, y, w, h = bbox
-            if w <= 0 or h <= 0:
-                continue
-
-            img_path = self._find_image_path(file_name)
-            if img_path is None:
-                if file_name not in self._missing_images:
-                    print(f"[WARN] Image not found: {file_name}")
-                    self._missing_images.add(file_name)
-                continue
-
-            loaded_samples.append({
-                "img_path": img_path,
-                "file_name": file_name,
-                "image_id": image_id,
-                "annotation_id": ann.get("id", -1),
-                "bbox_xywh": [float(x), float(y), float(w), float(h)],
-                "label": label,
-            })
-
-        return loaded_samples
-
-    def _find_image_path(self, file_name: str) -> Optional[Path]:
-        for root in self.image_roots:
-            candidate = root / file_name
-            if candidate.exists():
-                return candidate
-
-            candidate2 = root / Path(file_name).name
-            if candidate2.exists():
-                return candidate2
-
-        return None
-
-    @staticmethod
-    def _expanded_xyxy_from_xywh(
-        bbox_xywh,
-        img_w: int,
-        img_h: int,
-        expand_ratio: float,
-        min_crop_size: int,
-    ):
-        x, y, w, h = bbox_xywh
-
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-
-        new_w = max(w * (1.0 + 2.0 * expand_ratio), float(min_crop_size))
-        new_h = max(h * (1.0 + 2.0 * expand_ratio), float(min_crop_size))
-
-        x1 = int(np.floor(cx - new_w / 2.0))
-        y1 = int(np.floor(cy - new_h / 2.0))
-        x2 = int(np.ceil(cx + new_w / 2.0))
-        y2 = int(np.ceil(cy + new_h / 2.0))
-
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(img_w, x2)
-        y2 = min(img_h, y2)
-
-        if x2 - x1 < min_crop_size:
-            deficit = min_crop_size - (x2 - x1)
-            x1 = max(0, x1 - deficit // 2)
-            x2 = min(img_w, x2 + deficit - deficit // 2)
-
-        if y2 - y1 < min_crop_size:
-            deficit = min_crop_size - (y2 - y1)
-            y1 = max(0, y1 - deficit // 2)
-            y2 = min(img_h, y2 + deficit - deficit // 2)
-
-        if x2 <= x1:
-            x1 = max(0, min(x1, img_w - 1))
-            x2 = min(img_w, x1 + max(1, min_crop_size))
-
-        if y2 <= y1:
-            y1 = max(0, min(y1, img_h - 1))
-            y2 = min(img_h, y1 + max(1, min_crop_size))
-
-        return x1, y1, x2, y2
+        return pixel_values, torch.tensor(rec["label"], dtype=torch.long), meta
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
