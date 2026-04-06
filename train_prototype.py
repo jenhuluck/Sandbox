@@ -34,7 +34,31 @@ ID_TO_CLASS = {i: c for c, i in CLASS_TO_ID.items()}
 # -------------------------
 # Utils
 # -------------------------
+def save_projection_artifacts(
+    out_dir: Path,
+    model: "ProtoMapperModel",
+    proto_a: torch.Tensor,
+    proto_b: torch.Tensor,
+    b_feats: torch.Tensor,
+    b_labels: torch.Tensor,
+    class_names: list[str],
+    prefix: str = "viz",
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    model.eval()
+    with torch.no_grad():
+        mapped_proto_a = model.map_prototypes(proto_a)
+
+    np.save(out_dir / f"{prefix}_proto_a_before.npy", proto_a.detach().cpu().numpy())
+    np.save(out_dir / f"{prefix}_proto_a_after.npy", mapped_proto_a.detach().cpu().numpy())
+    np.save(out_dir / f"{prefix}_proto_b.npy", proto_b.detach().cpu().numpy())   # optional
+    np.save(out_dir / f"{prefix}_b_instances.npy", b_feats.detach().cpu().numpy())
+    np.save(out_dir / f"{prefix}_b_labels.npy", b_labels.detach().cpu().numpy())
+    np.save(out_dir / f"{prefix}_class_names.npy", np.asarray(class_names, dtype=object))
+
+    print(f"Saved projection artifacts to: {out_dir}")
+    
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
