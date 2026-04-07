@@ -50,6 +50,14 @@ def save_coords_csv(path, proto_labels, proto_before_xy, proto_after_xy, inst_la
                              inst_xy[i, 0], inst_xy[i, 1]])
 
 
+def save_class_avg_distances_csv(path, class_avg_dists):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["class_name", "avg_dist_before", "avg_dist_after", "n_instances"])
+        for cls, vals in class_avg_dists.items():
+            writer.writerow([cls, vals["before"], vals["after"], vals["n_instances"]])
+
+
 # -----------------------------
 # Feature / projection helpers
 # -----------------------------
@@ -120,7 +128,6 @@ def filter_by_classes(
     if drop_proto_without_instances:
         inst_class_set = set(inst_labels_f)
         proto_idx2 = [i for i, c in enumerate(proto_labels_f) if c in inst_class_set]
-
         proto_before_f = proto_before_f[proto_idx2]
         proto_after_f = proto_after_f[proto_idx2]
         proto_labels_f = [proto_labels_f[i] for i in proto_idx2]
@@ -139,6 +146,42 @@ def split_projected_coords(proto_before, proto_after, instances, method="pca"):
     proto_after_xy = coords[n_proto:2 * n_proto]
     inst_xy = coords[2 * n_proto:2 * n_proto + n_inst]
     return proto_before_xy, proto_after_xy, inst_xy
+
+
+# -----------------------------
+# Distance helpers
+# -----------------------------
+def compute_class_avg_distances(
+    proto_before_xy,
+    proto_after_xy,
+    inst_xy,
+    proto_labels,
+    inst_labels,
+):
+    results = {}
+
+    unique_proto_classes = list(dict.fromkeys(proto_labels))
+    for cls in unique_proto_classes:
+        pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+        iidx = [i for i, c in enumerate(inst_labels) if c == cls]
+
+        if len(pidx) == 0 or len(iidx) == 0:
+            continue
+
+        pb = proto_before_xy[pidx].mean(axis=0)
+        pa = proto_after_xy[pidx].mean(axis=0)
+        inst_pts = inst_xy[iidx]
+
+        d_before = np.linalg.norm(inst_pts - pb[None, :], axis=1)
+        d_after = np.linalg.norm(inst_pts - pa[None, :], axis=1)
+
+        results[cls] = {
+            "before": float(d_before.mean()),
+            "after": float(d_after.mean()),
+            "n_instances": int(len(iidx)),
+        }
+
+    return results
 
 
 # -----------------------------
@@ -318,8 +361,17 @@ def make_animation(
     fps=20,
     seconds=8,
     title="Prototype Motion Before and After Mapping",
+    show_distance_text=True,
 ):
     colors = class_color_map(proto_labels)
+    class_avg_dists = compute_class_avg_distances(
+        proto_before_xy=proto_before_xy,
+        proto_after_xy=proto_after_xy,
+        inst_xy=inst_xy,
+        proto_labels=proto_labels,
+        inst_labels=inst_labels,
+    )
+
     fig, ax = plt.subplots(figsize=(12, 10))
 
     setup_axes(ax, proto_before_xy, proto_after_xy, inst_xy, title)
@@ -372,6 +424,12 @@ def make_animation(
 
     texts = []
     traj_lines = []
+    before_dist_texts = []
+    after_dist_texts = []
+
+    xspan = ax.get_xlim()[1] - ax.get_xlim()[0]
+    yspan = ax.get_ylim()[1] - ax.get_ylim()[0]
+
     for i, cls in enumerate(proto_labels):
         t = ax.text(
             proto_before_xy[i, 0],
@@ -394,6 +452,40 @@ def make_animation(
             zorder=4,
         )
         traj_lines.append(line)
+
+        if show_distance_text and cls in class_avg_dists:
+            db = class_avg_dists[cls]["before"]
+            da = class_avg_dists[cls]["after"]
+
+            tb = ax.text(
+                proto_before_xy[i, 0] - 0.02 * xspan,
+                proto_before_xy[i, 1] - 0.02 * yspan,
+                f"d_before={db:.3f}",
+                fontsize=8,
+                ha="right",
+                va="top",
+                color=colors[cls],
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+                zorder=7,
+            )
+            ta = ax.text(
+                proto_after_xy[i, 0] + 0.02 * xspan,
+                proto_after_xy[i, 1] + 0.02 * yspan,
+                f"d_after={da:.3f}",
+                fontsize=8,
+                ha="left",
+                va="bottom",
+                color=colors[cls],
+                alpha=0.0,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+                zorder=7,
+            )
+        else:
+            tb = ax.text(0, 0, "", alpha=0.0)
+            ta = ax.text(0, 0, "", alpha=0.0)
+
+        before_dist_texts.append(tb)
+        after_dist_texts.append(ta)
 
     total_frames = fps * seconds
     hold_start = max(1, int(0.18 * total_frames))
@@ -438,7 +530,27 @@ def make_animation(
                 [proto_before_xy[i, 1], current_xy[i, 1]],
             )
 
-        return [before_static, proto_scatter, after_static, subtitle, *texts, *traj_lines]
+        for i, cls in enumerate(proto_labels):
+            before_dist_texts[i].set_position((
+                proto_before_xy[i, 0] - 0.02 * xspan,
+                proto_before_xy[i, 1] - 0.02 * yspan,
+            ))
+            after_dist_texts[i].set_position((
+                proto_after_xy[i, 0] + 0.02 * xspan,
+                proto_after_xy[i, 1] + 0.02 * yspan,
+            ))
+            after_dist_texts[i].set_alpha(1.0 if alpha >= 1.0 and show_distance_text else 0.0)
+
+        return [
+            before_static,
+            proto_scatter,
+            after_static,
+            subtitle,
+            *texts,
+            *traj_lines,
+            *before_dist_texts,
+            *after_dist_texts,
+        ]
 
     anim = FuncAnimation(
         fig,
@@ -501,6 +613,7 @@ def make_per_class_animations(
             fps=fps,
             seconds=seconds,
             title=f"{cls}: Prototype Motion Before and After Mapping",
+            show_distance_text=True,
         )
 
 
@@ -522,12 +635,28 @@ def make_staged_animation(
     seconds_per_class=3,
     final_seconds=3,
     title="Prototype Motion by Category",
+    inactive_instance_alpha=0.12,
+    inactive_proto_alpha=0.10,
+    active_instance_alpha=0.85,
+    active_proto_alpha=1.00,
+    final_instance_alpha=0.55,
+    final_proto_alpha=0.90,
 ):
     unique_classes = [c for c in dict.fromkeys(proto_labels) if c in set(inst_labels)]
     colors = class_color_map(unique_classes)
+    class_avg_dists = compute_class_avg_distances(
+        proto_before_xy=proto_before_xy,
+        proto_after_xy=proto_after_xy,
+        inst_xy=inst_xy,
+        proto_labels=proto_labels,
+        inst_labels=inst_labels,
+    )
 
     fig, ax = plt.subplots(figsize=(12, 10))
     setup_axes(ax, proto_before_xy, proto_after_xy, inst_xy, title)
+
+    xspan = ax.get_xlim()[1] - ax.get_xlim()[0]
+    yspan = ax.get_ylim()[1] - ax.get_ylim()[0]
 
     inst_scatters = {}
     proto_before_sc = {}
@@ -536,6 +665,8 @@ def make_staged_animation(
     texts = {}
     traj_lines = {}
     thumb_by_class = {}
+    before_dist_texts = {}
+    after_dist_texts = {}
 
     for cls in unique_classes:
         pidx = [i for i, c in enumerate(proto_labels) if c == cls]
@@ -544,7 +675,7 @@ def make_staged_animation(
         inst_pts = inst_xy[iidx]
         inst_scatters[cls] = ax.scatter(
             inst_pts[:, 0], inst_pts[:, 1],
-            s=55, c=[colors[cls]], alpha=0.12, marker="o", edgecolors="none", zorder=2
+            s=55, c=[colors[cls]], alpha=inactive_instance_alpha, marker="o", edgecolors="none", zorder=2
         )
 
         if show_thumbnails and instance_image_paths is not None and len(iidx) > 0:
@@ -556,7 +687,7 @@ def make_staged_animation(
             for local_i in selected_local:
                 artist = add_thumbnail(ax, sub_xy[local_i], sub_paths[local_i], zoom=thumbnail_zoom)
                 if artist is not None:
-                    artist.set_alpha(0.18)
+                    artist.set_alpha(inactive_instance_alpha)
                     cls_thumb_artists.append(artist)
             thumb_by_class[cls] = cls_thumb_artists
         else:
@@ -567,12 +698,12 @@ def make_staged_animation(
 
         proto_before_sc[cls] = ax.scatter(
             pb[:, 0], pb[:, 1],
-            s=220, c=[colors[cls]], marker="X", alpha=0.08,
+            s=220, c=[colors[cls]], marker="X", alpha=inactive_proto_alpha,
             edgecolors="black", linewidths=0.8, zorder=3
         )
         proto_move_sc[cls] = ax.scatter(
             pb[:, 0], pb[:, 1],
-            s=260, c=[colors[cls]], marker="*", alpha=0.15,
+            s=260, c=[colors[cls]], marker="*", alpha=inactive_proto_alpha,
             edgecolors="black", linewidths=1.0, zorder=5
         )
         proto_after_sc[cls] = ax.scatter(
@@ -583,19 +714,55 @@ def make_staged_animation(
 
         cls_texts = []
         cls_lines = []
+        cls_before_dist = []
+        cls_after_dist = []
+
         for j, i_proto in enumerate(pidx):
-            t = ax.text(pb[j, 0], pb[j, 1], cls, fontsize=10, ha="left", va="bottom", alpha=0.12, zorder=6)
+            t = ax.text(pb[j, 0], pb[j, 1], cls, fontsize=10, ha="left", va="bottom", alpha=inactive_proto_alpha, zorder=6)
             cls_texts.append(t)
 
             (line,) = ax.plot(
                 [pb[j, 0], pb[j, 0]],
                 [pb[j, 1], pb[j, 1]],
-                linestyle="--", linewidth=1.8, color=colors[cls], alpha=0.12, zorder=4
+                linestyle="--", linewidth=1.8, color=colors[cls], alpha=inactive_proto_alpha, zorder=4
             )
             cls_lines.append(line)
 
+            if cls in class_avg_dists:
+                db = class_avg_dists[cls]["before"]
+                da = class_avg_dists[cls]["after"]
+
+                tb = ax.text(
+                    pb[j, 0] - 0.02 * xspan, pb[j, 1] - 0.02 * yspan,
+                    f"d_before={db:.3f}",
+                    fontsize=8,
+                    ha="right", va="top",
+                    color=colors[cls],
+                    alpha=inactive_proto_alpha,
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+                    zorder=7,
+                )
+                ta = ax.text(
+                    pa[j, 0] + 0.02 * xspan, pa[j, 1] + 0.02 * yspan,
+                    f"d_after={da:.3f}",
+                    fontsize=8,
+                    ha="left", va="bottom",
+                    color=colors[cls],
+                    alpha=0.0,
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+                    zorder=7,
+                )
+            else:
+                tb = ax.text(0, 0, "", alpha=0.0)
+                ta = ax.text(0, 0, "", alpha=0.0)
+
+            cls_before_dist.append(tb)
+            cls_after_dist.append(ta)
+
         texts[cls] = cls_texts
         traj_lines[cls] = cls_lines
+        before_dist_texts[cls] = cls_before_dist
+        after_dist_texts[cls] = cls_after_dist
 
     subtitle = ax.text(
         0.02, 0.98, "",
@@ -612,23 +779,25 @@ def make_staged_animation(
     total_frames = frames_per_class * len(unique_classes) + final_frames
 
     def set_class_visibility(cls, active=False, final=False):
-        dim_inst = 0.10 if not final else 0.45
-        act_inst = 0.80 if active else dim_inst
+        inst_alpha = active_instance_alpha if active else (final_instance_alpha if final else inactive_instance_alpha)
+        proto_alpha = active_proto_alpha if active else (final_proto_alpha if final else inactive_proto_alpha)
 
-        dim_proto = 0.08 if not final else 0.22
-        act_proto = 0.95 if active else dim_proto
-
-        inst_scatters[cls].set_alpha(act_inst)
-        proto_before_sc[cls].set_alpha(0.16 if active else (0.08 if not final else 0.12))
-        proto_move_sc[cls].set_alpha(act_proto)
-        proto_after_sc[cls].set_alpha(0.0 if active and not final else (0.14 if not final else 0.30))
+        inst_scatters[cls].set_alpha(inst_alpha)
+        proto_before_sc[cls].set_alpha(0.18 if active else (0.14 if final else inactive_proto_alpha))
+        proto_move_sc[cls].set_alpha(proto_alpha)
+        proto_after_sc[cls].set_alpha(0.30 if final else (0.0 if active else 0.08))
 
         for t in texts[cls]:
-            t.set_alpha(0.95 if active or final else 0.12)
+            t.set_alpha(0.95 if active or final else inactive_proto_alpha)
         for line in traj_lines[cls]:
-            line.set_alpha(0.95 if active or final else 0.12)
+            line.set_alpha(0.95 if active or final else inactive_proto_alpha)
         for thumb in thumb_by_class[cls]:
-            thumb.set_alpha(1.0 if active else (0.18 if not final else 0.55))
+            thumb.set_alpha(inst_alpha)
+
+        for t in before_dist_texts[cls]:
+            t.set_alpha(0.95 if active or final else inactive_proto_alpha)
+        for t in after_dist_texts[cls]:
+            t.set_alpha(0.85 if final else (0.0 if active else 0.0))
 
     def update(frame):
         if frame < frames_per_class * len(unique_classes):
@@ -642,6 +811,7 @@ def make_staged_animation(
             for cls in unique_classes:
                 set_class_visibility(cls, active=(cls == active_cls), final=False)
                 pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+
                 if cls == active_cls:
                     current_xy = (1 - alpha) * proto_before_xy[pidx] + alpha * proto_after_xy[pidx]
                 else:
@@ -655,6 +825,20 @@ def make_staged_animation(
                         [proto_before_xy[i_proto, 0], current_xy[j, 0]],
                         [proto_before_xy[i_proto, 1], current_xy[j, 1]],
                     )
+                    before_dist_texts[cls][j].set_position((
+                        proto_before_xy[i_proto, 0] - 0.02 * xspan,
+                        proto_before_xy[i_proto, 1] - 0.02 * yspan,
+                    ))
+                    after_dist_texts[cls][j].set_position((
+                        proto_after_xy[i_proto, 0] + 0.02 * xspan,
+                        proto_after_xy[i_proto, 1] + 0.02 * yspan,
+                    ))
+
+                    # show after-distance only when active class finishes moving
+                    if cls == active_cls and alpha >= 1.0:
+                        after_dist_texts[cls][j].set_alpha(0.85)
+                    else:
+                        after_dist_texts[cls][j].set_alpha(0.0)
         else:
             subtitle.set_text("All categories together")
             for cls in unique_classes:
@@ -669,6 +853,15 @@ def make_staged_animation(
                         [proto_before_xy[i_proto, 0], current_xy[j, 0]],
                         [proto_before_xy[i_proto, 1], current_xy[j, 1]],
                     )
+                    before_dist_texts[cls][j].set_position((
+                        proto_before_xy[i_proto, 0] - 0.02 * xspan,
+                        proto_before_xy[i_proto, 1] - 0.02 * yspan,
+                    ))
+                    after_dist_texts[cls][j].set_position((
+                        proto_after_xy[i_proto, 0] + 0.02 * xspan,
+                        proto_after_xy[i_proto, 1] + 0.02 * yspan,
+                    ))
+                    after_dist_texts[cls][j].set_alpha(0.85)
 
         artists = [subtitle]
         for cls in unique_classes:
@@ -676,6 +869,8 @@ def make_staged_animation(
             artists.extend(texts[cls])
             artists.extend(traj_lines[cls])
             artists.extend(thumb_by_class[cls])
+            artists.extend(before_dist_texts[cls])
+            artists.extend(after_dist_texts[cls])
         return artists
 
     anim = FuncAnimation(
@@ -708,6 +903,8 @@ def main():
 
     parser.add_argument("--out_png", type=str, default="projection_plot.png")
     parser.add_argument("--out_csv", type=str, default="projection_coords.csv")
+    parser.add_argument("--out_dist_csv", type=str, default="class_avg_distances.csv")
+
     parser.add_argument("--out_animation", type=str, default=None,
                         help="Standard all-classes animation (.mp4 or .gif)")
     parser.add_argument("--per_class_dir", type=str, default=None,
@@ -726,6 +923,13 @@ def main():
                         help="Seconds per class for staged animation")
     parser.add_argument("--final_seconds", type=int, default=3,
                         help="Final all-classes-together stage duration")
+
+    parser.add_argument("--inactive_instance_alpha", type=float, default=0.12)
+    parser.add_argument("--inactive_proto_alpha", type=float, default=0.10)
+    parser.add_argument("--active_instance_alpha", type=float, default=0.85)
+    parser.add_argument("--active_proto_alpha", type=float, default=1.00)
+    parser.add_argument("--final_instance_alpha", type=float, default=0.55)
+    parser.add_argument("--final_proto_alpha", type=float, default=0.90)
 
     args = parser.parse_args()
 
@@ -787,6 +991,15 @@ def main():
 
     save_coords_csv(args.out_csv, proto_labels, proto_before_xy, proto_after_xy, inst_labels, inst_xy)
 
+    class_avg_dists = compute_class_avg_distances(
+        proto_before_xy=proto_before_xy,
+        proto_after_xy=proto_after_xy,
+        inst_xy=inst_xy,
+        proto_labels=proto_labels,
+        inst_labels=inst_labels,
+    )
+    save_class_avg_distances_csv(args.out_dist_csv, class_avg_dists)
+
     plot_projection(
         proto_labels=proto_labels,
         proto_before_xy=proto_before_xy,
@@ -798,6 +1011,7 @@ def main():
     )
     print(f"Saved static plot to: {args.out_png}")
     print(f"Saved coordinates to: {args.out_csv}")
+    print(f"Saved class average distances to: {args.out_dist_csv}")
 
     if args.out_animation:
         make_animation(
@@ -814,6 +1028,7 @@ def main():
             fps=args.fps,
             seconds=args.seconds,
             title="Prototype Motion Before and After Mapping",
+            show_distance_text=True,
         )
         print(f"Saved animation to: {args.out_animation}")
 
@@ -850,6 +1065,12 @@ def main():
             seconds_per_class=args.seconds_per_class,
             final_seconds=args.final_seconds,
             title="Prototype Motion by Category",
+            inactive_instance_alpha=args.inactive_instance_alpha,
+            inactive_proto_alpha=args.inactive_proto_alpha,
+            active_instance_alpha=args.active_instance_alpha,
+            active_proto_alpha=args.active_proto_alpha,
+            final_instance_alpha=args.final_instance_alpha,
+            final_proto_alpha=args.final_proto_alpha,
         )
         print(f"Saved staged animation to: {args.staged_animation}")
 
