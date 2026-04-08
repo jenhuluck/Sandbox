@@ -14,342 +14,6 @@ from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 # -----------------------------
 # I/O helpers
 # -----------------------------
-def make_focus_zoom_animation(
-    proto_before_xy,
-    proto_after_xy,
-    inst_xy,
-    proto_labels,
-    inst_labels,
-    focus_class,
-    out_path,
-    instance_image_paths=None,
-    show_thumbnails=False,
-    thumbs_per_class=1,
-    thumbnail_zoom=0.30,
-    fps=20,
-    intro_seconds=2,
-    zoom_seconds=2,
-    move_seconds=3,
-    hold_final_seconds=2,
-    title="Category Focus Animation",
-    inactive_instance_alpha=0.08,
-    inactive_proto_alpha=0.08,
-    active_instance_alpha=0.90,
-    active_proto_alpha=1.00,
-):
-    unique_classes = [c for c in dict.fromkeys(proto_labels) if c in set(inst_labels)]
-    if focus_class not in unique_classes:
-        raise ValueError(f"focus_class '{focus_class}' not found in filtered classes: {unique_classes}")
-
-    colors = class_color_map(unique_classes)
-
-    fig, ax = plt.subplots(figsize=(12, 10))
-
-    # ----- global limits
-    (gxmin, gxmax), (gymin, gymax) = compute_axis_limits(proto_before_xy, proto_after_xy, inst_xy, pad_ratio=0.08)
-    ax.set_xlim(gxmin, gxmax)
-    ax.set_ylim(gymin, gymax)
-    ax.set_xlabel("Component 1")
-    ax.set_ylabel("Component 2")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.25)
-
-    # ----- focus indices
-    pidx_focus = [i for i, c in enumerate(proto_labels) if c == focus_class]
-    iidx_focus = [i for i, c in enumerate(inst_labels) if c == focus_class]
-
-    if len(pidx_focus) == 0 or len(iidx_focus) == 0:
-        raise ValueError(f"focus_class '{focus_class}' must have both prototype(s) and instance(s)")
-
-    # local limits from:
-    # - focus instances
-    # - focus proto before
-    # - focus proto after
-    focus_points = np.concatenate([
-        inst_xy[iidx_focus],
-        proto_before_xy[pidx_focus],
-        proto_after_xy[pidx_focus],
-    ], axis=0)
-
-    fxmin, fymin = focus_points.min(axis=0)
-    fxmax, fymax = focus_points.max(axis=0)
-    fpadx = 0.20 * max(1e-6, fxmax - fxmin)
-    fpady = 0.20 * max(1e-6, fymax - fymin)
-    fxmin, fxmax = fxmin - fpadx, fxmax + fpadx
-    fymin, fymax = fymin - fpady, fymax + fpady
-
-    # ----- artists by class
-    inst_scatters = {}
-    proto_before_sc = {}
-    proto_move_sc = {}
-    proto_after_sc = {}
-    texts = {}
-    traj_lines = {}
-    thumb_by_class = {}
-
-    for cls in unique_classes:
-        pidx = [i for i, c in enumerate(proto_labels) if c == cls]
-        iidx = [i for i, c in enumerate(inst_labels) if c == cls]
-
-        inst_pts = inst_xy[iidx]
-        is_focus = (cls == focus_class)
-
-        inst_scatters[cls] = ax.scatter(
-            inst_pts[:, 0], inst_pts[:, 1],
-            s=55,
-            c=[colors[cls]],
-            alpha=active_instance_alpha if is_focus else 0.55,
-            marker="o",
-            edgecolors="none",
-            zorder=2
-        )
-
-        pb = proto_before_xy[pidx]
-        pa = proto_after_xy[pidx]
-
-        proto_before_sc[cls] = ax.scatter(
-            pb[:, 0], pb[:, 1],
-            s=220,
-            c=[colors[cls]],
-            marker="X",
-            alpha=active_proto_alpha if is_focus else 0.35,
-            edgecolors="black",
-            linewidths=0.8,
-            zorder=3
-        )
-
-        proto_move_sc[cls] = ax.scatter(
-            pb[:, 0], pb[:, 1],
-            s=260,
-            c=[colors[cls]],
-            marker="*",
-            alpha=active_proto_alpha if is_focus else 0.40,
-            edgecolors="black",
-            linewidths=1.0,
-            zorder=5
-        )
-
-        proto_after_sc[cls] = ax.scatter(
-            pa[:, 0], pa[:, 1],
-            s=240,
-            c=[colors[cls]],
-            marker="*",
-            alpha=0.0,
-            edgecolors="black",
-            linewidths=1.0,
-            zorder=4
-        )
-
-        cls_texts = []
-        cls_lines = []
-        for j, i_proto in enumerate(pidx):
-            t = ax.text(
-                pb[j, 0], pb[j, 1],
-                cls,
-                fontsize=10 if is_focus else 9,
-                ha="left",
-                va="bottom",
-                alpha=0.95 if is_focus else 0.40,
-                zorder=6
-            )
-            cls_texts.append(t)
-
-            (line,) = ax.plot(
-                [pb[j, 0], pb[j, 0]],
-                [pb[j, 1], pb[j, 1]],
-                linestyle="--",
-                linewidth=1.8,
-                color=colors[cls],
-                alpha=0.95 if is_focus else 0.25,
-                zorder=4
-            )
-            cls_lines.append(line)
-
-        texts[cls] = cls_texts
-        traj_lines[cls] = cls_lines
-
-        # optional thumbnails
-        if show_thumbnails and instance_image_paths is not None and len(iidx) > 0:
-            sub_xy = inst_xy[iidx]
-            sub_labels = [inst_labels[i] for i in iidx]
-            sub_paths = [instance_image_paths[i] for i in iidx]
-            selected_local = select_thumbnail_indices(
-                sub_xy, sub_labels, max_per_class=min(thumbs_per_class, len(iidx))
-            )
-            cls_thumb_artists = []
-            for local_i in selected_local:
-                artist = add_thumbnail(ax, sub_xy[local_i], sub_paths[local_i], zoom=thumbnail_zoom)
-                if artist is not None:
-                    artist.set_alpha(1.0 if is_focus else 0.25)
-                    cls_thumb_artists.append(artist)
-            thumb_by_class[cls] = cls_thumb_artists
-        else:
-            thumb_by_class[cls] = []
-
-    subtitle = ax.text(
-        0.02, 0.98, "All categories",
-        transform=ax.transAxes,
-        ha="left", va="top",
-        fontsize=12,
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
-    )
-
-    add_marker_legend(ax)
-
-    intro_frames = fps * intro_seconds
-    zoom_frames = fps * zoom_seconds
-    move_frames = fps * move_seconds
-    hold_frames = fps * hold_final_seconds
-    total_frames = intro_frames + zoom_frames + move_frames + hold_frames
-
-    def lerp(a, b, t):
-        return (1 - t) * a + t * b
-
-    def set_focus_visibility(mode):
-        # mode:
-        # 0 = full view, normal
-        # 1 = focus selected, others dimmed
-        # 2 = final focus
-        for cls in unique_classes:
-            is_focus = (cls == focus_class)
-
-            if mode == 0:
-                inst_a = active_instance_alpha if is_focus else 0.55
-                proto_a = active_proto_alpha if is_focus else 0.40
-                text_a = 0.95 if is_focus else 0.45
-                line_a = 0.95 if is_focus else 0.25
-                thumb_a = 1.0 if is_focus else 0.25
-            elif mode == 1:
-                inst_a = active_instance_alpha if is_focus else inactive_instance_alpha
-                proto_a = active_proto_alpha if is_focus else inactive_proto_alpha
-                text_a = 0.95 if is_focus else inactive_proto_alpha
-                line_a = 0.95 if is_focus else inactive_proto_alpha
-                thumb_a = 1.0 if is_focus else inactive_instance_alpha
-            else:
-                inst_a = active_instance_alpha if is_focus else inactive_instance_alpha
-                proto_a = active_proto_alpha if is_focus else inactive_proto_alpha
-                text_a = 0.95 if is_focus else inactive_proto_alpha
-                line_a = 0.95 if is_focus else inactive_proto_alpha
-                thumb_a = 1.0 if is_focus else inactive_instance_alpha
-
-            inst_scatters[cls].set_alpha(inst_a)
-            proto_before_sc[cls].set_alpha(0.18 if is_focus else proto_a * 0.6)
-            proto_move_sc[cls].set_alpha(proto_a)
-            proto_after_sc[cls].set_alpha(0.0 if mode != 2 else (0.18 if is_focus else 0.0))
-
-            for t in texts[cls]:
-                t.set_alpha(text_a)
-            for line in traj_lines[cls]:
-                line.set_alpha(line_a)
-            for thumb in thumb_by_class[cls]:
-                thumb.set_alpha(thumb_a)
-
-    def update(frame):
-        # phase 1: show everything
-        if frame < intro_frames:
-            subtitle.set_text("All categories")
-            set_focus_visibility(mode=0)
-
-            ax.set_xlim(gxmin, gxmax)
-            ax.set_ylim(gymin, gymax)
-
-            for cls in unique_classes:
-                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
-                current_xy = proto_before_xy[pidx]
-                proto_move_sc[cls].set_offsets(current_xy)
-                for j, i_proto in enumerate(pidx):
-                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
-                    traj_lines[cls][j].set_data(
-                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
-                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
-                    )
-
-        # phase 2: dim others + zoom in
-        elif frame < intro_frames + zoom_frames:
-            subtitle.set_text(f"Focus on: {focus_class}")
-            set_focus_visibility(mode=1)
-
-            t = (frame - intro_frames) / max(1, zoom_frames - 1)
-
-            ax.set_xlim(lerp(gxmin, fxmin, t), lerp(gxmax, fxmax, t))
-            ax.set_ylim(lerp(gymin, fymin, t), lerp(gymax, fymax, t))
-
-            for cls in unique_classes:
-                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
-                current_xy = proto_before_xy[pidx]
-                proto_move_sc[cls].set_offsets(current_xy)
-                for j, i_proto in enumerate(pidx):
-                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
-                    traj_lines[cls][j].set_data(
-                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
-                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
-                    )
-
-        # phase 3: move only focused class
-        elif frame < intro_frames + zoom_frames + move_frames:
-            subtitle.set_text(f"{focus_class}: prototype motion")
-            set_focus_visibility(mode=1)
-
-            ax.set_xlim(fxmin, fxmax)
-            ax.set_ylim(fymin, fymax)
-
-            t = (frame - intro_frames - zoom_frames) / max(1, move_frames - 1)
-
-            for cls in unique_classes:
-                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
-                if cls == focus_class:
-                    current_xy = (1 - t) * proto_before_xy[pidx] + t * proto_after_xy[pidx]
-                else:
-                    current_xy = proto_before_xy[pidx]
-
-                proto_move_sc[cls].set_offsets(current_xy)
-
-                for j, i_proto in enumerate(pidx):
-                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
-                    traj_lines[cls][j].set_data(
-                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
-                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
-                    )
-
-        # phase 4: hold final focused result
-        else:
-            subtitle.set_text(f"{focus_class}: after mapping")
-            set_focus_visibility(mode=2)
-
-            ax.set_xlim(fxmin, fxmax)
-            ax.set_ylim(fymin, fymax)
-
-            for cls in unique_classes:
-                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
-                current_xy = proto_after_xy[pidx] if cls == focus_class else proto_before_xy[pidx]
-                proto_move_sc[cls].set_offsets(current_xy)
-
-                for j, i_proto in enumerate(pidx):
-                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
-                    traj_lines[cls][j].set_data(
-                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
-                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
-                    )
-
-        artists = [subtitle]
-        for cls in unique_classes:
-            artists.extend([inst_scatters[cls], proto_before_sc[cls], proto_move_sc[cls], proto_after_sc[cls]])
-            artists.extend(texts[cls])
-            artists.extend(traj_lines[cls])
-            artists.extend(thumb_by_class[cls])
-        return artists
-
-    anim = FuncAnimation(
-        fig,
-        update,
-        frames=total_frames,
-        interval=1000 / fps,
-        blit=False,
-        repeat=False,
-    )
-    save_animation(anim, out_path, fps=fps)
-    plt.close(fig)
-
 def load_labels(path):
     if path is None:
         return None
@@ -541,10 +205,12 @@ def setup_axes(ax, proto_before_xy, proto_after_xy, inst_xy, title):
     (xmin, xmax), (ymin, ymax) = compute_axis_limits(proto_before_xy, proto_after_xy, inst_xy)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
-    ax.set_xlabel("Component 1")
-    ax.set_ylabel("Component 2")
+    ax.set_xlabel("Space Feature 1")
+    ax.set_ylabel("Space Feature 2")
     ax.set_title(title)
     ax.grid(True, alpha=0.25)
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 def add_thumbnail(ax, xy, img_path, zoom=0.30):
@@ -608,8 +274,6 @@ def add_thumbnails(ax, inst_xy, inst_labels, instance_image_paths, thumbs_per_cl
 
 def add_marker_legend(ax):
     marker_guide = [
-        plt.Line2D([0], [0], marker='o', linestyle='', label='Target instances',
-                   markersize=8, markerfacecolor='gray', markeredgecolor='none'),
         plt.Line2D([0], [0], marker='X', linestyle='', label='Prototype before',
                    markersize=10, markerfacecolor='gray', markeredgecolor='black'),
         plt.Line2D([0], [0], marker='*', linestyle='', label='Prototype after / moving',
@@ -768,8 +432,8 @@ def make_animation(
 
     for i, cls in enumerate(proto_labels):
         t = ax.text(
-            proto_before_xy[i, 0],
-            proto_before_xy[i, 1],
+            proto_before_xy[i, 0] + 0.03 * xspan,
+            proto_before_xy[i, 1] + 0.03 * yspan,
             cls,
             fontsize=9,
             ha="left",
@@ -796,7 +460,7 @@ def make_animation(
             tb = ax.text(
                 proto_before_xy[i, 0] - 0.02 * xspan,
                 proto_before_xy[i, 1] - 0.02 * yspan,
-                f"d_before={db:.3f}",
+                f"{db:.2f}",
                 fontsize=8,
                 ha="right",
                 va="top",
@@ -807,7 +471,7 @@ def make_animation(
             ta = ax.text(
                 proto_after_xy[i, 0] + 0.02 * xspan,
                 proto_after_xy[i, 1] + 0.02 * yspan,
-                f"d_after={da:.3f}",
+                f"{da:.2f}",
                 fontsize=8,
                 ha="left",
                 va="bottom",
@@ -858,7 +522,7 @@ def make_animation(
         proto_scatter.set_offsets(current_xy)
 
         for i, txt in enumerate(texts):
-            txt.set_position((current_xy[i, 0], current_xy[i, 1]))
+            txt.set_position((current_xy[i, 0] + 0.03 * xspan, current_xy[i, 1] + 0.03 * yspan))
 
         for i, line in enumerate(traj_lines):
             line.set_data(
@@ -1054,7 +718,7 @@ def make_staged_animation(
         cls_after_dist = []
 
         for j, i_proto in enumerate(pidx):
-            t = ax.text(pb[j, 0], pb[j, 1], cls, fontsize=10, ha="left", va="bottom", alpha=inactive_proto_alpha, zorder=6)
+            t = ax.text(pb[j, 0] + 0.03 * xspan, pb[j, 1] + 0.03 * yspan, cls, fontsize=10, ha="left", va="bottom", alpha=inactive_proto_alpha, zorder=6)
             cls_texts.append(t)
 
             (line,) = ax.plot(
@@ -1070,7 +734,7 @@ def make_staged_animation(
 
                 tb = ax.text(
                     pb[j, 0] - 0.02 * xspan, pb[j, 1] - 0.02 * yspan,
-                    f"d_before={db:.3f}",
+                    f"{db:.2f}",
                     fontsize=8,
                     ha="right", va="top",
                     color=colors[cls],
@@ -1080,7 +744,7 @@ def make_staged_animation(
                 )
                 ta = ax.text(
                     pa[j, 0] + 0.02 * xspan, pa[j, 1] + 0.02 * yspan,
-                    f"d_after={da:.3f}",
+                    f"{da:.2f}",
                     fontsize=8,
                     ha="left", va="bottom",
                     color=colors[cls],
@@ -1156,7 +820,7 @@ def make_staged_animation(
                 proto_move_sc[cls].set_offsets(current_xy)
 
                 for j, i_proto in enumerate(pidx):
-                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
+                    texts[cls][j].set_position((current_xy[j, 0] + 0.03 * xspan, current_xy[j, 1] + 0.03 * yspan))
                     traj_lines[cls][j].set_data(
                         [proto_before_xy[i_proto, 0], current_xy[j, 0]],
                         [proto_before_xy[i_proto, 1], current_xy[j, 1]],
@@ -1184,7 +848,7 @@ def make_staged_animation(
                 proto_move_sc[cls].set_offsets(current_xy)
 
                 for j, i_proto in enumerate(pidx):
-                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
+                    texts[cls][j].set_position((current_xy[j, 0] + 0.03 * xspan, current_xy[j, 1] + 0.03 * yspan))
                     traj_lines[cls][j].set_data(
                         [proto_before_xy[i_proto, 0], current_xy[j, 0]],
                         [proto_before_xy[i_proto, 1], current_xy[j, 1]],
@@ -1216,6 +880,348 @@ def make_staged_animation(
     plt.close(fig)
 
 
+def make_focus_zoom_animation(
+    proto_before_xy,
+    proto_after_xy,
+    inst_xy,
+    proto_labels,
+    inst_labels,
+    focus_class,
+    out_path,
+    instance_image_paths=None,
+    show_thumbnails=False,
+    thumbs_per_class=1,
+    thumbnail_zoom=0.80,
+    fps=20,
+    intro_seconds=2,
+    zoom_seconds=2,
+    move_seconds=3,
+    hold_final_seconds=2,
+    title="Category Focus Animation",
+    inactive_instance_alpha=0.08,
+    inactive_proto_alpha=0.08,
+    active_instance_alpha=0.90,
+    active_proto_alpha=1.00,
+):
+    unique_classes = [c for c in dict.fromkeys(proto_labels) if c in set(inst_labels)]
+    if focus_class not in unique_classes:
+        raise ValueError(f"focus_class '{focus_class}' not found in filtered classes: {unique_classes}")
+
+    colors = class_color_map(unique_classes)
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # ----- global limits
+    (gxmin, gxmax), (gymin, gymax) = compute_axis_limits(proto_before_xy, proto_after_xy, inst_xy, pad_ratio=0.08)
+    ax.set_xlim(gxmin, gxmax)
+    ax.set_ylim(gymin, gymax)
+    ax.set_xlabel("Space Feature 1")
+    ax.set_ylabel("Space Feature 2")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # ----- focus indices
+    pidx_focus = [i for i, c in enumerate(proto_labels) if c == focus_class]
+    iidx_focus = [i for i, c in enumerate(inst_labels) if c == focus_class]
+
+    if len(pidx_focus) == 0 or len(iidx_focus) == 0:
+        raise ValueError(f"focus_class '{focus_class}' must have both prototype(s) and instance(s)")
+
+    # local limits from:
+    # - focus instances
+    # - focus proto before
+    # - focus proto after
+    focus_points = np.concatenate([
+        inst_xy[iidx_focus],
+        proto_before_xy[pidx_focus],
+        proto_after_xy[pidx_focus],
+    ], axis=0)
+
+    fxmin, fymin = focus_points.min(axis=0)
+    fxmax, fymax = focus_points.max(axis=0)
+    fpadx = 0.20 * max(1e-6, fxmax - fxmin)
+    fpady = 0.20 * max(1e-6, fymax - fymin)
+    fxmin, fxmax = fxmin - fpadx, fxmax + fpadx
+    fymin, fymax = fymin - fpady, fymax + fpady
+
+    # ----- artists by class
+    inst_scatters = {}
+    proto_before_sc = {}
+    proto_move_sc = {}
+    proto_after_sc = {}
+    texts = {}
+    traj_lines = {}
+    thumb_by_class = {}
+
+    for cls in unique_classes:
+        pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+        iidx = [i for i, c in enumerate(inst_labels) if c == cls]
+
+        inst_pts = inst_xy[iidx]
+        is_focus = (cls == focus_class)
+
+        inst_scatters[cls] = ax.scatter(
+            inst_pts[:, 0], inst_pts[:, 1],
+            s=55,
+            c=[colors[cls]],
+            alpha=active_instance_alpha if is_focus else 0.55,
+            marker="o",
+            edgecolors="none",
+            zorder=2
+        )
+
+        pb = proto_before_xy[pidx]
+        pa = proto_after_xy[pidx]
+
+        proto_before_sc[cls] = ax.scatter(
+            pb[:, 0], pb[:, 1],
+            s=220,
+            c=[colors[cls]],
+            marker="X",
+            alpha=active_proto_alpha if is_focus else 0.35,
+            edgecolors="black",
+            linewidths=0.8,
+            zorder=3
+        )
+
+        proto_move_sc[cls] = ax.scatter(
+            pb[:, 0], pb[:, 1],
+            s=260,
+            c=[colors[cls]],
+            marker="*",
+            alpha=active_proto_alpha if is_focus else 0.40,
+            edgecolors="black",
+            linewidths=1.0,
+            zorder=5
+        )
+
+        proto_after_sc[cls] = ax.scatter(
+            pa[:, 0], pa[:, 1],
+            s=240,
+            c=[colors[cls]],
+            marker="*",
+            alpha=0.0,
+            edgecolors="black",
+            linewidths=1.0,
+            zorder=4
+        )
+
+        cls_texts = []
+        cls_lines = []
+
+        # calculate text offset based on global span
+        gxspan = gxmax - gxmin
+        gyspan = gymax - gymin
+
+        for j, i_proto in enumerate(pidx):
+            t = ax.text(
+                pb[j, 0] + 0.03 * gxspan, pb[j, 1] + 0.03 * gyspan,
+                cls,
+                fontsize=10 if is_focus else 9,
+                ha="left",
+                va="bottom",
+                alpha=0.95 if is_focus else 0.40,
+                zorder=6
+            )
+            cls_texts.append(t)
+
+            (line,) = ax.plot(
+                [pb[j, 0], pb[j, 0]],
+                [pb[j, 1], pb[j, 1]],
+                linestyle="--",
+                linewidth=1.8,
+                color=colors[cls],
+                alpha=0.95 if is_focus else 0.25,
+                zorder=4
+            )
+            cls_lines.append(line)
+
+        texts[cls] = cls_texts
+        traj_lines[cls] = cls_lines
+
+        # optional thumbnails
+        if show_thumbnails and instance_image_paths is not None and len(iidx) > 0:
+            sub_xy = inst_xy[iidx]
+            sub_labels = [inst_labels[i] for i in iidx]
+            sub_paths = [instance_image_paths[i] for i in iidx]
+            selected_local = select_thumbnail_indices(
+                sub_xy, sub_labels, max_per_class=min(thumbs_per_class, len(iidx))
+            )
+            cls_thumb_artists = []
+            for local_i in selected_local:
+                artist = add_thumbnail(ax, sub_xy[local_i], sub_paths[local_i], zoom=thumbnail_zoom)
+                if artist is not None:
+                    artist.set_alpha(1.0 if is_focus else 0.25)
+                    cls_thumb_artists.append(artist)
+            thumb_by_class[cls] = cls_thumb_artists
+        else:
+            thumb_by_class[cls] = []
+
+    subtitle = ax.text(
+        0.02, 0.98, "All categories",
+        transform=ax.transAxes,
+        ha="left", va="top",
+        fontsize=12,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
+    )
+
+    add_marker_legend(ax)
+
+    intro_frames = fps * intro_seconds
+    zoom_frames = fps * zoom_seconds
+    move_frames = fps * move_seconds
+    hold_frames = fps * hold_final_seconds
+    total_frames = intro_frames + zoom_frames + move_frames + hold_frames
+
+    def lerp(a, b, t):
+        return (1 - t) * a + t * b
+
+    def set_focus_visibility(mode):
+        # mode:
+        # 0 = full view, normal
+        # 1 = focus selected, others dimmed
+        # 2 = final focus
+        for cls in unique_classes:
+            is_focus = (cls == focus_class)
+
+            if mode == 0:
+                inst_a = active_instance_alpha if is_focus else 0.55
+                proto_a = active_proto_alpha if is_focus else 0.40
+                text_a = 0.95 if is_focus else 0.45
+                line_a = 0.95 if is_focus else 0.25
+                thumb_a = 1.0 if is_focus else 0.25
+            elif mode == 1:
+                inst_a = active_instance_alpha if is_focus else inactive_instance_alpha
+                proto_a = active_proto_alpha if is_focus else inactive_proto_alpha
+                text_a = 0.95 if is_focus else inactive_proto_alpha
+                line_a = 0.95 if is_focus else inactive_proto_alpha
+                thumb_a = 1.0 if is_focus else inactive_instance_alpha
+            else:
+                inst_a = active_instance_alpha if is_focus else inactive_instance_alpha
+                proto_a = active_proto_alpha if is_focus else inactive_proto_alpha
+                text_a = 0.95 if is_focus else inactive_proto_alpha
+                line_a = 0.95 if is_focus else inactive_proto_alpha
+                thumb_a = 1.0 if is_focus else inactive_instance_alpha
+
+            inst_scatters[cls].set_alpha(inst_a)
+            proto_before_sc[cls].set_alpha(0.18 if is_focus else proto_a * 0.6)
+            proto_move_sc[cls].set_alpha(proto_a)
+            proto_after_sc[cls].set_alpha(0.0 if mode != 2 else (0.18 if is_focus else 0.0))
+
+            for t in texts[cls]:
+                t.set_alpha(text_a)
+            for line in traj_lines[cls]:
+                line.set_alpha(line_a)
+            for thumb in thumb_by_class[cls]:
+                thumb.set_alpha(thumb_a)
+
+    def update(frame):
+        # phase 1: show everything
+        if frame < intro_frames:
+            subtitle.set_text("All categories")
+            set_focus_visibility(mode=0)
+
+            ax.set_xlim(gxmin, gxmax)
+            ax.set_ylim(gymin, gymax)
+
+            for cls in unique_classes:
+                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+                current_xy = proto_before_xy[pidx]
+                proto_move_sc[cls].set_offsets(current_xy)
+                for j, i_proto in enumerate(pidx):
+                    texts[cls][j].set_position((current_xy[j, 0] + 0.03 * gxspan, current_xy[j, 1] + 0.03 * gyspan))
+                    traj_lines[cls][j].set_data(
+                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
+                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
+                    )
+
+        # phase 2: dim others + zoom in
+        elif frame < intro_frames + zoom_frames:
+            subtitle.set_text(f"Focus on: {focus_class}")
+            set_focus_visibility(mode=1)
+
+            t = (frame - intro_frames) / max(1, zoom_frames - 1)
+
+            ax.set_xlim(lerp(gxmin, fxmin, t), lerp(gxmax, fxmax, t))
+            ax.set_ylim(lerp(gymin, fymin, t), lerp(gymax, fymax, t))
+
+            for cls in unique_classes:
+                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+                current_xy = proto_before_xy[pidx]
+                proto_move_sc[cls].set_offsets(current_xy)
+                for j, i_proto in enumerate(pidx):
+                    texts[cls][j].set_position((current_xy[j, 0] + 0.03 * gxspan, current_xy[j, 1] + 0.03 * gyspan))
+                    traj_lines[cls][j].set_data(
+                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
+                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
+                    )
+
+        # phase 3: move only focused class
+        elif frame < intro_frames + zoom_frames + move_frames:
+            subtitle.set_text(f"{focus_class}: prototype motion")
+            set_focus_visibility(mode=1)
+
+            ax.set_xlim(fxmin, fxmax)
+            ax.set_ylim(fymin, fymax)
+
+            t = (frame - intro_frames - zoom_frames) / max(1, move_frames - 1)
+
+            for cls in unique_classes:
+                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+                if cls == focus_class:
+                    current_xy = (1 - t) * proto_before_xy[pidx] + t * proto_after_xy[pidx]
+                else:
+                    current_xy = proto_before_xy[pidx]
+
+                proto_move_sc[cls].set_offsets(current_xy)
+
+                for j, i_proto in enumerate(pidx):
+                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
+                    traj_lines[cls][j].set_data(
+                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
+                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
+                    )
+
+        # phase 4: hold final focused result
+        else:
+            subtitle.set_text(f"{focus_class}: after mapping")
+            set_focus_visibility(mode=2)
+
+            ax.set_xlim(fxmin, fxmax)
+            ax.set_ylim(fymin, fymax)
+
+            for cls in unique_classes:
+                pidx = [i for i, c in enumerate(proto_labels) if c == cls]
+                current_xy = proto_after_xy[pidx] if cls == focus_class else proto_before_xy[pidx]
+                proto_move_sc[cls].set_offsets(current_xy)
+
+                for j, i_proto in enumerate(pidx):
+                    texts[cls][j].set_position((current_xy[j, 0], current_xy[j, 1]))
+                    traj_lines[cls][j].set_data(
+                        [proto_before_xy[i_proto, 0], current_xy[j, 0]],
+                        [proto_before_xy[i_proto, 1], current_xy[j, 1]],
+                    )
+
+        artists = [subtitle]
+        for cls in unique_classes:
+            artists.extend([inst_scatters[cls], proto_before_sc[cls], proto_move_sc[cls], proto_after_sc[cls]])
+            artists.extend(texts[cls])
+            artists.extend(traj_lines[cls])
+            artists.extend(thumb_by_class[cls])
+        return artists
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=total_frames,
+        interval=1000 / fps,
+        blit=False,
+        repeat=False,
+    )
+    save_animation(anim, out_path, fps=fps)
+    plt.close(fig)
 # -----------------------------
 # Main
 # -----------------------------
@@ -1247,10 +1253,14 @@ def main():
                         help="Output directory for one animation per category")
     parser.add_argument("--staged_animation", type=str, default=None,
                         help="Output path for staged category-by-category animation (.mp4 or .gif)")
+    parser.add_argument("--focus_zoom_animation", type=str, default=None,
+                        help="Output path for focus zoom animation (.mp4 or .gif)")
+    parser.add_argument("--focus_class", type=str, default=None,
+                        help="Class name to focus on for focus zoom animation")
 
     parser.add_argument("--show_thumbnails", action="store_true")
     parser.add_argument("--thumbs_per_class", type=int, default=1)
-    parser.add_argument("--thumbnail_zoom", type=float, default=0.30)
+    parser.add_argument("--thumbnail_zoom", type=float, default=0.80)
 
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--seconds", type=int, default=8,
@@ -1259,6 +1269,15 @@ def main():
                         help="Seconds per class for staged animation")
     parser.add_argument("--final_seconds", type=int, default=3,
                         help="Final all-classes-together stage duration")
+
+    parser.add_argument("--intro_seconds", type=int, default=2,
+                        help="Intro seconds for focus zoom animation")
+    parser.add_argument("--zoom_seconds", type=int, default=2,
+                        help="Zoom seconds for focus zoom animation")
+    parser.add_argument("--move_seconds", type=int, default=3,
+                        help="Move seconds for focus zoom animation")
+    parser.add_argument("--hold_final_seconds", type=int, default=2,
+                        help="Hold final seconds for focus zoom animation")
 
     parser.add_argument("--inactive_instance_alpha", type=float, default=0.12)
     parser.add_argument("--inactive_proto_alpha", type=float, default=0.10)
@@ -1409,6 +1428,34 @@ def main():
             final_proto_alpha=args.final_proto_alpha,
         )
         print(f"Saved staged animation to: {args.staged_animation}")
+
+    if args.focus_zoom_animation:
+        if not args.focus_class:
+            raise ValueError("--focus_class is required when using --focus_zoom_animation")
+        make_focus_zoom_animation(
+            proto_before_xy=proto_before_xy,
+            proto_after_xy=proto_after_xy,
+            inst_xy=inst_xy,
+            proto_labels=proto_labels,
+            inst_labels=inst_labels,
+            focus_class=args.focus_class,
+            out_path=args.focus_zoom_animation,
+            instance_image_paths=instance_image_paths,
+            show_thumbnails=args.show_thumbnails,
+            thumbs_per_class=args.thumbs_per_class,
+            thumbnail_zoom=args.thumbnail_zoom,
+            fps=args.fps,
+            intro_seconds=args.intro_seconds,
+            zoom_seconds=args.zoom_seconds,
+            move_seconds=args.move_seconds,
+            hold_final_seconds=args.hold_final_seconds,
+            title="Category Focus Animation",
+            inactive_instance_alpha=args.inactive_instance_alpha,
+            inactive_proto_alpha=args.inactive_proto_alpha,
+            active_instance_alpha=args.active_instance_alpha,
+            active_proto_alpha=args.active_proto_alpha,
+        )
+        print(f"Saved focus zoom animation to: {args.focus_zoom_animation}")
 
 
 if __name__ == "__main__":
