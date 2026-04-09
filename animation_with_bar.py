@@ -1,4 +1,4 @@
-def make_focus_zoom_animation_twice(
+def make_focus_zoom_animation(
     proto_before_xy,
     proto_after_xy,
     inst_xy,
@@ -16,14 +16,14 @@ def make_focus_zoom_animation_twice(
     focus_move_seconds=3,
     final_hold_seconds=2,
     title=None,
-    inactive_instance_alpha=0.10,
-    inactive_proto_alpha=0.08,
+    inactive_instance_alpha=0.9,
+    inactive_proto_alpha=0.9,
     active_instance_alpha=0.90,
     active_proto_alpha=1.00,
     label_dx_ratio=0.020,
     label_dy_ratio=0.040,
     show_distance_bars=True,
-    distance_bar_alpha=0.90,
+    distance_bar_alpha=0.80,
 ):
     def fmt_label(s):
         s = str(s).replace("_", " ").strip()
@@ -138,7 +138,8 @@ def make_focus_zoom_animation_twice(
             inst_pts[:, 0], inst_pts[:, 1],
             s=55,
             c=[color_map[cls]],
-            alpha=active_instance_alpha if is_focus else 0.55,
+            #alpha=active_instance_alpha if is_focus else 0.55,
+            alpha=active_instance_alpha,
             marker="o",
             edgecolors="none",
             zorder=2,
@@ -152,7 +153,8 @@ def make_focus_zoom_animation_twice(
             s=220,
             c=[color_map[cls]],
             marker="X",
-            alpha=0.20 if is_focus else 0.16,
+            #alpha=0.20 if is_focus else 0.16,
+            alpha=active_instance_alpha,
             edgecolors="black",
             linewidths=0.8,
             zorder=3,
@@ -163,7 +165,8 @@ def make_focus_zoom_animation_twice(
             s=260,
             c=[color_map[cls]],
             marker="*",
-            alpha=active_proto_alpha if is_focus else 0.40,
+            #alpha=active_proto_alpha if is_focus else 0.40,
+            alpha=active_instance_alpha,
             edgecolors="black",
             linewidths=1.0,
             zorder=5,
@@ -190,7 +193,8 @@ def make_focus_zoom_animation_twice(
                 fontsize=11 if is_focus else 10,
                 ha="left",
                 va="bottom",
-                alpha=0.95 if is_focus else 0.40,
+                #alpha=0.95 if is_focus else 0.40,
+                alpha=active_instance_alpha,
                 zorder=7,
                 bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.65, edgecolor="none"),
             )
@@ -202,7 +206,8 @@ def make_focus_zoom_animation_twice(
                 linestyle="--",
                 linewidth=1.8,
                 color=color_map[cls],
-                alpha=0.95 if is_focus else 0.25,
+                #alpha=0.95 if is_focus else 0.25,
+                alpha=active_instance_alpha,
                 zorder=4,
             )
             cls_lines.append(line)
@@ -221,7 +226,7 @@ def make_focus_zoom_animation_twice(
             for local_i in selected_local:
                 artist = add_thumbnail(ax, sub_xy[local_i], sub_paths[local_i], zoom=thumbnail_zoom)
                 if artist is not None:
-                    artist.set_alpha(1.0 if is_focus else 0.22)
+                    artist.set_alpha(1.0)
                     cls_thumb_artists.append(artist)
             thumb_by_class[cls] = cls_thumb_artists
         else:
@@ -294,7 +299,7 @@ def make_focus_zoom_animation_twice(
         )
         avg_text_after = ax_bar.text(
             avg_before - 0.04 * max_bar_val,
-            0.25,
+            -0.9,
             f"Avg after = {avg_after:.3f}",
             ha="right",
             va="bottom",
@@ -323,32 +328,32 @@ def make_focus_zoom_animation_twice(
             is_focus = (cls == focus_class)
 
             if mode == "whole_move":
-                inst_a = 0.60 if not is_focus else active_instance_alpha
-                proto_a = 0.45 if not is_focus else active_proto_alpha
-                text_a = 0.45 if not is_focus else 0.95
-                line_a = 0.25 if not is_focus else 0.95
-                thumb_a = 0.22 if not is_focus else 1.0
+                inst_a = active_instance_alpha
+                proto_a = active_proto_alpha
+                text_a = 0.95
+                line_a = 0.95
+                thumb_a = 1.0
             elif mode == "zoom":
-                inst_a = inactive_instance_alpha if not is_focus else active_instance_alpha
-                proto_a = inactive_proto_alpha if not is_focus else active_proto_alpha
-                text_a = inactive_proto_alpha if not is_focus else 0.95
-                line_a = inactive_proto_alpha if not is_focus else 0.95
-                thumb_a = inactive_instance_alpha if not is_focus else 1.0
+                inst_a = active_instance_alpha
+                proto_a = active_proto_alpha
+                text_a = 0.95
+                line_a = 0.95
+                thumb_a = 1.0
             elif mode == "focus_move":
-                inst_a = inactive_instance_alpha if not is_focus else active_instance_alpha
-                proto_a = inactive_proto_alpha if not is_focus else active_proto_alpha
-                text_a = inactive_proto_alpha if not is_focus else 0.95
-                line_a = inactive_proto_alpha if not is_focus else 0.95
-                thumb_a = inactive_instance_alpha if not is_focus else 1.0
+                inst_a = active_instance_alpha
+                proto_a = active_proto_alpha
+                text_a = 0.95
+                line_a = 0.95
+                thumb_a = 1.0
             else:
-                inst_a = inactive_instance_alpha if not is_focus else active_instance_alpha
-                proto_a = inactive_proto_alpha if not is_focus else active_proto_alpha
-                text_a = inactive_proto_alpha if not is_focus else 0.95
-                line_a = inactive_proto_alpha if not is_focus else 0.95
-                thumb_a = inactive_instance_alpha if not is_focus else 1.0
+                inst_a = active_instance_alpha
+                proto_a = active_proto_alpha
+                text_a = 0.95
+                line_a = 0.95
+                thumb_a = 1.0
 
             inst_scatters[cls].set_alpha(inst_a)
-            proto_before_sc[cls].set_alpha(0.18 if is_focus else proto_a * 0.5)
+            proto_before_sc[cls].set_alpha(0.18 if is_focus else 0.18)
             proto_move_sc[cls].set_alpha(proto_a)
             proto_after_sc[cls].set_alpha(0.16 if (mode == "final" and is_focus) else 0.0)
 
@@ -399,7 +404,7 @@ def make_focus_zoom_animation_twice(
         vline_after.set_xdata([current_avg, current_avg])
 
         avg_text_before.set_position((avg_before - 0.04 * max_bar_val, -0.45))
-        avg_text_after.set_position((current_avg - 0.04 * max_bar_val, 0.25))
+        avg_text_after.set_position((current_avg - 0.04 * max_bar_val, -0.9))
         avg_text_after.set_text(f"Avg after = {current_avg:.3f}")
 
         if alpha <= 0.0:
