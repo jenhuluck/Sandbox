@@ -99,3 +99,161 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+import argparse
+import json
+import subprocess
+import shlex
+import os
+
+
+def run_cmd(cmd):
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed:\n{' '.join(shlex.quote(c) for c in cmd)}\n\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+    return result.stdout
+
+
+def get_duration(video_path):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        video_path,
+    ]
+    output = run_cmd(cmd)
+    data = json.loads(output)
+    return float(data["format"]["duration"])
+
+
+def has_audio(video_path):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "json",
+        video_path,
+    ]
+    output = run_cmd(cmd)
+    data = json.loads(output)
+    return len(data.get("streams", [])) > 0
+
+
+def build_filter(width, height, fps, d1, d2, d3, transition, a1, a2, a3):
+    # Video preprocessing
+    vf = []
+
+    for i in range(3):
+        vf.append(
+            f"[{i}:v]"
+            f"fps={fps},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+            f"format=yuv420p,"
+            f"setsar=1"
+            f"[v{i}]"
+        )
+
+    # Audio preprocessing
+    # If no audio exists, generate silent audio so acrossfade still works.
+    for i, has_a in enumerate([a1, a2, a3]):
+        if has_a:
+            vf.append(f"[{i}:a]aresample=async=1[a{i}]")
+        else:
+            # anullsrc creates silent stereo audio
+            # trim duration to match clip duration
+            dur = [d1, d2, d3][i]
+            vf.append(
+                f"anullsrc=r=44100:cl=stereo,"
+                f"atrim=duration={dur},"
+                f"asetpts=N/SR/TB"
+                f"[a{i}]"
+            )
+
+    # Transition offsets
+    offset1 = d1 - transition
+    offset2 = (d1 - transition) + d2 - transition
+
+    # Video transitions
+    vf.append(
+        f"[v0][v1]xfade=transition=fade:duration={transition}:offset={offset1}[v01]"
+    )
+    vf.append(
+        f"[v01][v2]xfade=transition=fade:duration={transition}:offset={offset2}[vout]"
+    )
+
+    # Audio transitions
+    vf.append(f"[a0][a1]acrossfade=d={transition}[a01]")
+    vf.append(f"[a01][a2]acrossfade=d={transition}[aout]")
+
+    return ";".join(vf)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Concatenate 3 videos with resize/pad and fade transitions using ffmpeg.")
+    parser.add_argument("--video1", required=True, help="First input video")
+    parser.add_argument("--video2", required=True, help="Second input video")
+    parser.add_argument("--video3", required=True, help="Third input video")
+    parser.add_argument("--output", default="merged_output.mp4", help="Output video path")
+    parser.add_argument("--width", type=int, default=1280, help="Output width")
+    parser.add_argument("--height", type=int, default=720, help="Output height")
+    parser.add_argument("--fps", type=int, default=30, help="Output fps")
+    parser.add_argument("--transition", type=float, default=1.0, help="Fade duration in seconds")
+    args = parser.parse_args()
+
+    for path in [args.video1, args.video2, args.video3]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+
+    d1 = get_duration(args.video1)
+    d2 = get_duration(args.video2)
+    d3 = get_duration(args.video3)
+
+    if d1 <= args.transition or d2 <= args.transition or d3 <= args.transition:
+        raise ValueError("Each video must be longer than the transition duration.")
+
+    a1 = has_audio(args.video1)
+    a2 = has_audio(args.video2)
+    a3 = has_audio(args.video3)
+
+    filter_complex = build_filter(
+        args.width,
+        args.height,
+        args.fps,
+        d1, d2, d3,
+        args.transition,
+        a1, a2, a3
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", args.video1,
+        "-i", args.video2,
+        "-i", args.video3,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        args.output,
+    ]
+
+    print("Running ffmpeg command...")
+    print(" ".join(shlex.quote(c) for c in cmd))
+    run_cmd(cmd)
+    print(f"Done. Output saved to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
