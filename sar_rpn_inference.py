@@ -1,263 +1,204 @@
 #!/usr/bin/env python3
-"""
-SAR RPN Inference Script
-Generate and cache RPN proposals from SAR images using MMDetection model.
-"""
-
 import os
 import sys
+import cv2
+import json
 import pickle
 import argparse
 from pathlib import Path
-from tqdm import tqdm
+
 import numpy as np
 import torch
-import cv2
 
-# Add MSFA to path to register custom modules
+# ---------------------------------------------------------------------
+# Optional: add MSFA repo to path so custom modules can register
+# ---------------------------------------------------------------------
 MSFA_PATH = "/home/jhu/SATLOCK/MSFA/MSFA"
 if MSFA_PATH not in sys.path:
     sys.path.insert(0, MSFA_PATH)
 
-# Import MSFA modules to register custom backbones and datasets
 try:
-    import msfa
+    import msfa  # noqa: F401
     from msfa.models.backbones.MSFA import MSFA
     from mmdet.registry import MODELS
 
-    # Register MSFA as Self_features_model (alias for backwards compatibility)
-    if not MODELS.get('Self_features_model'):
-        MODELS.register_module(name='Self_features_model', module=MSFA)
-
-    print(f"Successfully imported MSFA modules from {MSFA_PATH}")
-except ImportError as e:
-    print(f"Warning: Could not import MSFA modules from {MSFA_PATH}: {e}")
-    print("Custom models like MSFA backbone may not be available.")
+    # Alias used in some custom configs
+    if MODELS.get("Self_features_model") is None:
+        MODELS.register_module(name="Self_features_model", module=MSFA)
+except Exception as e:
+    print(f"Warning: MSFA registration issue: {e}")
 
 from mmengine.config import Config
-from mmengine.runner import Runner
-from mmdet.apis import init_detector, inference_detector
+from mmengine.runner import load_checkpoint
+from mmengine.dataset import Compose
+from mmdet.registry import MODELS
+from mmdet.utils import register_all_modules
 
 
-def load_sar_model(config_file, checkpoint_file, device='cuda'):
-    """
-    Load SAR detection model from MMDetection.
+def build_model(cfg_path: str, ckpt_path: str, device: str = "cuda:0"):
+    register_all_modules(init_default_scope=True)
 
-    Args:
-        config_file: Path to MMDetection config file
-        checkpoint_file: Path to model checkpoint
-        device: Device to run inference on
+    cfg = Config.fromfile(cfg_path)
 
-    Returns:
-        model: Loaded MMDetection model
-    """
-    model = init_detector(config_file, checkpoint_file, device=device)
+    model = MODELS.build(cfg.model)
+    load_checkpoint(model, ckpt_path, map_location="cpu")
+    model.cfg = cfg
+    model.to(device)
     model.eval()
-    return model
+    return model, cfg
 
 
-def extract_rpn_proposals(model, image_path, device='cuda', target_size=(800, 800)):
+def build_test_pipeline(cfg):
     """
-    Extract RPN proposals from a single image.
-
-    Args:
-        model: MMDetection model
-        image_path: Path to input image
-        device: Device for inference
-        target_size: Target size (H, W) to resize image to
-
-    Returns:
-        boxes: numpy array of shape (N, 4) with boxes in xyxy format (in original image coordinates)
-        scores: numpy array of shape (N,) with objectness scores
+    Use cfg.test_pipeline if present; otherwise fall back to
+    cfg.test_dataloader.dataset.pipeline.
     """
-    # Load image
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise FileNotFoundError(f"Cannot load image: {image_path}")
+    if hasattr(cfg, "test_pipeline") and cfg.test_pipeline is not None:
+        pipeline_cfg = cfg.test_pipeline
+    elif (
+        hasattr(cfg, "test_dataloader")
+        and "dataset" in cfg.test_dataloader
+        and "pipeline" in cfg.test_dataloader.dataset
+    ):
+        pipeline_cfg = cfg.test_dataloader.dataset.pipeline
+    else:
+        raise ValueError("No test pipeline found in config.")
 
-    # Convert BGR to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # Make sure we do not require GT annotations for plain inference.
+    cleaned = [t for t in pipeline_cfg if t.get("type") != "LoadAnnotations"]
+    return Compose(cleaned)
 
-    ori_h, ori_w = img.shape[:2]
 
-    # Resize image to target size
-    img_resized = cv2.resize(img, (target_size[1], target_size[0]))
+@torch.no_grad()
+def extract_rpn_proposals(model, cfg, image_path: str, device: str = "cuda:0"):
+    pipeline = build_test_pipeline(cfg)
 
-    # Calculate scale factor
-    scale_h = target_size[0] / ori_h
-    scale_w = target_size[1] / ori_w
+    data = dict(
+        img_path=image_path,
+        img_id=0,
+    )
+    data = pipeline(data)
 
-    # Run inference to get RPN proposals
-    from mmdet.structures import DetDataSample
-    from mmengine.structures import InstanceData
+    # Pipeline output format expected by the data_preprocessor
+    batch = dict(
+        inputs=[data["inputs"].to(device)],
+        data_samples=[data["data_samples"]],
+    )
+    batch = model.data_preprocessor(batch, training=False)
 
-    # Create data sample in the format MMDet expects
-    data_sample = DetDataSample()
-    data_sample.set_metainfo({
-        'img_id': 0,
-        'img_path': str(image_path),
-        'ori_shape': (ori_h, ori_w),
-        'img_shape': target_size,
-        'scale_factor': (scale_w, scale_h)
-    })
+    feats = model.extract_feat(batch["inputs"])
+    rpn_results_list = model.rpn_head.predict(
+        feats,
+        batch["data_samples"],
+        rescale=True,
+    )
 
-    # Preprocess image - convert to tensor and normalize
-    # The model expects a batch, so we add batch dimension
-    data = {
-        'inputs': [torch.from_numpy(img_resized).permute(2, 0, 1).float().to(device)],
-        'data_samples': [data_sample]
-    }
-
-    # Use data preprocessor
-    data = model.data_preprocessor(data, False)
-
-    # Extract features
-    with torch.no_grad():
-        img_tensor = data['inputs']
-        batch_data_samples = data['data_samples']
-
-        # Get features from backbone and neck
-        x = model.extract_feat(img_tensor)
-
-        # Get RPN proposals
-        rpn_results_list = model.rpn_head.predict(
-            x, batch_data_samples, rescale=True  # Rescale to original image size
-        )
-
-    # Extract boxes and scores from the first (and only) image
-    rpn_results = rpn_results_list[0]
-
-    boxes = rpn_results.bboxes.cpu().numpy()  # (N, 4) in xyxy format (original size)
-    scores = rpn_results.scores.cpu().numpy()  # (N,)
+    result = rpn_results_list[0]
+    boxes = result.bboxes.detach().cpu().numpy()
+    scores = result.scores.detach().cpu().numpy()
 
     return boxes, scores
 
 
-def run_sar_rpn_inference(
-    image_dir,
-    output_cache_dir,
-    config_file,
-    checkpoint_file,
-    device='cuda',
-    topk=1000,
-    score_thresh=0.0,
-    save_format='pickle'
-):
-    """
-    Run RPN inference on all images in a directory and cache results.
+def filter_and_truncate(boxes, scores, score_thresh=0.0, topk=4000):
+    keep = scores >= score_thresh
+    boxes = boxes[keep]
+    scores = scores[keep]
 
-    Args:
-        image_dir: Directory containing input images
-        output_cache_dir: Directory to save cached proposals
-        config_file: Path to MMDetection config
-        checkpoint_file: Path to model checkpoint
-        device: Device for inference
-        topk: Keep only top-K proposals per image
-        score_thresh: Minimum objectness score threshold
-        save_format: Format to save cache ('pickle', 'torch', or 'npz')
-    """
-    os.makedirs(output_cache_dir, exist_ok=True)
+    order = np.argsort(-scores)
+    if topk is not None:
+        order = order[:topk]
 
-    # Load model
-    print(f"Loading SAR model from {checkpoint_file}...")
-    model = load_sar_model(config_file, checkpoint_file, device)
+    return boxes[order], scores[order]
 
-    # Get all image files
-    image_dir = Path(image_dir)
-    image_files = sorted([
-        f for f in image_dir.iterdir()
-        if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tif', '.tiff']
-    ])
 
-    print(f"Found {len(image_files)} images to process")
+def save_result(save_path: Path, boxes, scores, save_format="pickle"):
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Process each image
-    for img_path in tqdm(image_files, desc="Processing images"):
-        try:
-            # Extract RPN proposals
-            boxes, scores = extract_rpn_proposals(model, img_path, device)
+    if save_format == "pickle":
+        with open(save_path, "wb") as f:
+            pickle.dump(
+                {"boxes": boxes.astype(np.float32), "scores": scores.astype(np.float32)},
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+    elif save_format == "npz":
+        np.savez_compressed(
+            save_path,
+            boxes=boxes.astype(np.float32),
+            scores=scores.astype(np.float32),
+        )
+    elif save_format == "json":
+        payload = {
+            "boxes": boxes.astype(float).tolist(),
+            "scores": scores.astype(float).tolist(),
+        }
+        with open(save_path, "w") as f:
+            json.dump(payload, f)
+    else:
+        raise ValueError(f"Unsupported save_format: {save_format}")
 
-            # Sort by objectness score
-            idx = np.argsort(scores)[::-1]
-            boxes = boxes[idx]
-            scores = scores[idx]
 
-            # Apply score threshold
-            if score_thresh > 0:
-                keep = scores >= score_thresh
-                boxes = boxes[keep]
-                scores = scores[keep]
-
-            # Keep top-K
-            if topk is not None and len(boxes) > topk:
-                boxes = boxes[:topk]
-                scores = scores[:topk]
-
-            # Prepare data to cache
-            cache_data = {
-                'boxes': boxes,
-                'scores': scores,
-                'image_name': img_path.stem,
-                'image_shape': cv2.imread(str(img_path)).shape[:2]
-            }
-
-            # Save to cache
-            cache_name = img_path.stem
-            if save_format == 'pickle':
-                cache_path = Path(output_cache_dir) / f"{cache_name}.pkl"
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(cache_data, f)
-            elif save_format == 'torch':
-                cache_path = Path(output_cache_dir) / f"{cache_name}.pt"
-                torch.save(cache_data, cache_path)
-            elif save_format == 'npz':
-                cache_path = Path(output_cache_dir) / f"{cache_name}.npz"
-                np.savez(cache_path, **cache_data)
-            else:
-                raise ValueError(f"Unknown save format: {save_format}")
-
-        except Exception as e:
-            print(f"Error processing {img_path.name}: {e}")
-            continue
-
-    print(f"Done! Cached proposals saved to: {output_cache_dir}")
+def iter_images(image_dir):
+    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+    for p in sorted(Path(image_dir).rglob("*")):
+        if p.suffix.lower() in exts:
+            yield p
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Generate and cache RPN proposals from SAR images'
-    )
-    parser.add_argument('--image_dir', type=str, required=True,
-                       help='Directory containing input SAR images')
-    parser.add_argument('--output_cache_dir', type=str, required=True,
-                       help='Directory to save cached RPN proposals')
-    parser.add_argument('--config_file', type=str, required=True,
-                       help='Path to MMDetection config file')
-    parser.add_argument('--checkpoint_file', type=str, required=True,
-                       help='Path to model checkpoint')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device for inference (default: cuda)')
-    parser.add_argument('--topk', type=int, default=1000,
-                       help='Keep top-K proposals per image (default: 1000)')
-    parser.add_argument('--score_thresh', type=float, default=0.0,
-                       help='Minimum objectness score threshold (default: 0.0)')
-    parser.add_argument('--save_format', type=str, default='pickle',
-                       choices=['pickle', 'torch', 'npz'],
-                       help='Format to save cached proposals (default: pickle)')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, help="Path to config file")
+    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint")
+    parser.add_argument("--image_dir", required=True, help="Directory of input images")
+    parser.add_argument("--output_dir", required=True, help="Directory to save proposals")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--topk", type=int, default=None)
+    parser.add_argument("--score-thresh", type=float, default=None)
+    parser.add_argument("--save-format", default=None, choices=["pickle", "npz", "json"])
+    parser.add_argument("--debug-vis", action="store_true")
+    parser.add_argument("--debug-vis-topk", type=int, default=200)
     args = parser.parse_args()
 
-    run_sar_rpn_inference(
-        image_dir=args.image_dir,
-        output_cache_dir=args.output_cache_dir,
-        config_file=args.config_file,
-        checkpoint_file=args.checkpoint_file,
-        device=args.device,
-        topk=args.topk,
-        score_thresh=args.score_thresh,
-        save_format=args.save_format
-    )
+    model, cfg = build_model(args.config, args.checkpoint, args.device)
+
+    # Read defaults from cfg.rpn_cache_cfg if present
+    rpn_cache_cfg = getattr(cfg, "rpn_cache_cfg", {})
+    topk = args.topk if args.topk is not None else rpn_cache_cfg.get("max_proposals_per_image", 4000)
+    score_thresh = args.score_thresh if args.score_thresh is not None else rpn_cache_cfg.get("score_threshold", 0.0)
+    save_format = args.save_format if args.save_format is not None else rpn_cache_cfg.get("save_format", "pickle")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths = list(iter_images(args.image_dir))
+    print(f"Found {len(image_paths)} images")
+
+    for idx, image_path in enumerate(image_paths, 1):
+        boxes, scores = extract_rpn_proposals(model, cfg, str(image_path), args.device)
+        raw_n = len(boxes)
+
+        boxes, scores = filter_and_truncate(
+            boxes, scores, score_thresh=score_thresh, topk=topk
+        )
+        kept_n = len(boxes)
+
+        stem = image_path.stem
+        suffix = {"pickle": ".pkl", "npz": ".npz", "json": ".json"}[save_format]
+        save_path = output_dir / f"{stem}{suffix}"
+        save_result(save_path, boxes, scores, save_format=save_format)
+
+        print(f"[{idx}/{len(image_paths)}] {image_path.name}: raw={raw_n}, kept={kept_n}")
+
+        if args.debug_vis:
+            img = cv2.imread(str(image_path))
+            if img is not None:
+                for box in boxes[:args.debug_vis_topk]:
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                vis_path = output_dir / f"{stem}_debug.jpg"
+                cv2.imwrite(str(vis_path), img)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
