@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate an RPN-focused override config from a base Faster R-CNN config.
+Generate an RPN-focused override config from a base Faster R-CNN config,
+while KEEPING the original base test pipeline.
 
 Example:
-python make_rpn_config.py \
+python make_rpn_config_keep_pipeline.py \
     --base-config /path/to/fg_frcnn_dota_pretrain_sar_wavelet_r50.py \
-    --out-config /path/to/generated_rpn_fg_frcnn_dota_pretrain_sar_wavelet_r50.py \
-    --resize 1024 1024 \
-    --rpn-nms-pre 12000 \
-    --rpn-max-per-img 4000 \
-    --rpn-nms-iou 0.9 \
-    --cache-max-proposals 4000
+    --out-config /path/to/generated_rpn_fg_frcnn_dota_pretrain_sar_wavelet_r50.py
 """
 
 from __future__ import annotations
@@ -22,7 +18,6 @@ from textwrap import dedent
 
 def build_override_text(
     base_config: str,
-    resize_hw: tuple[int, int],
     rpn_nms_pre: int,
     rpn_max_per_img: int,
     rpn_nms_iou: float,
@@ -34,8 +29,6 @@ def build_override_text(
     cache_nms_threshold: float,
     save_format: str,
 ) -> str:
-    h, w = resize_hw
-
     return dedent(
         f"""
         # Auto-generated RPN proposal config
@@ -51,8 +44,8 @@ def build_override_text(
                     nms=dict(type='nms', iou_threshold={rpn_nms_iou}),
                     min_bbox_size=0,
                 ),
-                # RCNN settings are kept loose mainly for debugging.
-                # If you extract only model.rpn_head.predict(...), these matter less.
+                # These RCNN settings matter less if you only extract RPN proposals,
+                # but keeping them loose can help with debugging/comparison.
                 rcnn=dict(
                     score_thr={rcnn_score_thr},
                     nms=dict(type='nms', iou_threshold={rcnn_nms_iou}),
@@ -69,16 +62,9 @@ def build_override_text(
             save_format={save_format!r},
         )
 
-        # Plain inference pipeline for images without GT annotations.
-        # This overrides the base pipeline only for proposal extraction.
-        test_pipeline = [
-            dict(type='LoadImageFromFile', backend_args=None),
-            dict(type='Resize', scale=({w}, {h}), keep_ratio=False),
-            dict(
-                type='PackDetInputs',
-                meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor'),
-            ),
-        ]
+        # NOTE:
+        # We intentionally do NOT override test_pipeline here.
+        # The base config's original test pipeline will be used as-is.
         """
     ).strip() + "\n"
 
@@ -87,7 +73,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-config", required=True, help="Path to base FRCNN config")
     parser.add_argument("--out-config", required=True, help="Path to output generated config")
-    parser.add_argument("--resize", type=int, nargs=2, default=(1024, 1024), metavar=("H", "W"))
     parser.add_argument("--rpn-nms-pre", type=int, default=12000)
     parser.add_argument("--rpn-max-per-img", type=int, default=4000)
     parser.add_argument("--rpn-nms-iou", type=float, default=0.9)
@@ -105,7 +90,6 @@ def main():
 
     text = build_override_text(
         base_config=args.base_config,
-        resize_hw=tuple(args.resize),
         rpn_nms_pre=args.rpn_nms_pre,
         rpn_max_per_img=args.rpn_max_per_img,
         rpn_nms_iou=args.rpn_nms_iou,
