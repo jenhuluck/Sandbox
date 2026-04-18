@@ -158,6 +158,63 @@ def make_china_visa_photo(
     print("- top of hair visible")
     print("- no heavy shadow / glare")
 
+def make_background_pure_white(img: Image.Image, white_threshold=245):
+
+    """
+
+    Force near-white pixels to pure white.
+
+    white_threshold=245 means any pixel with all RGB >= 245 becomes 255.
+
+    """
+
+    arr = np.array(img).astype(np.uint8)
+
+    mask = (arr[:, :, 0] >= white_threshold) & \
+
+           (arr[:, :, 1] >= white_threshold) & \
+
+           (arr[:, :, 2] >= white_threshold)
+
+    arr[mask] = [255, 255, 255]
+
+    return Image.fromarray(arr)
+
+def remove_background_to_white_strict(pil_img: Image.Image) -> Image.Image:
+
+    pil_img = ImageOps.exif_transpose(pil_img).convert("RGBA")
+
+    if USE_REMBG:
+
+        cutout = remove(pil_img)   # RGBA
+
+        arr = np.array(cutout)
+
+        alpha = arr[:, :, 3].astype(np.float32) / 255.0
+
+        rgb = arr[:, :, :3].astype(np.float32)
+
+        # Composite on pure white
+
+        white = np.ones_like(rgb) * 255.0
+
+        comp = rgb * alpha[..., None] + white * (1.0 - alpha[..., None])
+
+        comp = np.clip(comp, 0, 255).astype(np.uint8)
+
+        out = Image.fromarray(comp).convert("RGB")
+
+        out = make_background_pure_white(out, white_threshold=245)
+
+        return out
+
+    # fallback
+
+    out = ImageOps.exif_transpose(pil_img).convert("RGB")
+
+    out = make_background_pure_white(out, white_threshold=245)
+
+    return out
 
 if __name__ == "__main__":
     input_path = "input.jpg"
