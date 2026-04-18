@@ -179,7 +179,67 @@ def make_background_pure_white(img: Image.Image, white_threshold=245):
     arr[mask] = [255, 255, 255]
 
     return Image.fromarray(arr)
+import numpy as np
+from PIL import Image, ImageOps
+from rembg import remove
+import cv2
 
+def remove_background_to_white_strict(
+    pil_img: Image.Image,
+    white_threshold: int = 245,
+    low_alpha_threshold: int = 220,
+    erode_mask: bool = False,
+    erode_iter: int = 1
+) -> Image.Image:
+    """
+    Remove background and replace with pure white, with stronger cleanup
+    of gray halos around hair/head edges.
+
+    Args:
+        pil_img: input PIL image
+        white_threshold: pixels above this RGB threshold become pure white
+        low_alpha_threshold: low-alpha pixels are forced toward white
+        erode_mask: whether to slightly shrink foreground mask
+        erode_iter: number of erosion iterations if erode_mask=True
+    """
+
+    # Fix phone rotation and ensure RGBA
+    pil_img = ImageOps.exif_transpose(pil_img).convert("RGBA")
+
+    # Background removal
+    cutout = remove(pil_img)   # RGBA
+    arr = np.array(cutout).astype(np.uint8)
+
+    if arr.shape[2] != 4:
+        raise RuntimeError("Expected RGBA output from rembg.")
+
+    rgb = arr[:, :, :3].astype(np.float32)
+    alpha = arr[:, :, 3].astype(np.uint8)
+
+    # Optional: shrink mask slightly to reduce gray fringe
+    if erode_mask:
+        kernel = np.ones((3, 3), np.uint8)
+        alpha = cv2.erode(alpha, kernel, iterations=erode_iter)
+
+    # Force low-alpha pixels to white before compositing
+    low_alpha_mask = alpha < low_alpha_threshold
+    rgb[low_alpha_mask] = 255.0
+
+    # Composite onto pure white background
+    a = alpha.astype(np.float32) / 255.0
+    white = np.ones_like(rgb) * 255.0
+    comp = rgb * a[..., None] + white * (1.0 - a[..., None])
+    comp = np.clip(comp, 0, 255).astype(np.uint8)
+
+    # Snap near-white pixels to fully white
+    near_white_mask = (
+        (comp[:, :, 0] >= white_threshold) &
+        (comp[:, :, 1] >= white_threshold) &
+        (comp[:, :, 2] >= white_threshold)
+    )
+    comp[near_white_mask] = [255, 255, 255]
+
+    return Image.fromarray(comp).convert("RGB")
 def remove_background_to_white_strict(pil_img: Image.Image) -> Image.Image:
 
     pil_img = ImageOps.exif_transpose(pil_img).convert("RGBA")
