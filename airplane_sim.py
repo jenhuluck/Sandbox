@@ -58,6 +58,36 @@ def save_json(path, obj):
         json.dump(obj, f, indent=2)
 
 
+def bbox_visible_fraction(bbox_xywh, image_w, image_h):
+    """
+    Compute visible fraction of a bbox after clipping to image boundary.
+    bbox_xywh: [x, y, w, h]
+    """
+    x, y, w, h = bbox_xywh
+    if w <= 0 or h <= 0:
+        return 0.0, None
+
+    x1, y1 = x, y
+    x2, y2 = x + w, y + h
+
+    cx1 = max(0, x1)
+    cy1 = max(0, y1)
+    cx2 = min(image_w, x2)
+    cy2 = min(image_h, y2)
+
+    cw = max(0, cx2 - cx1)
+    ch = max(0, cy2 - cy1)
+
+    visible_area = cw * ch
+    full_area = w * h
+    frac = visible_area / max(full_area, 1e-6)
+
+    if visible_area <= 0:
+        return 0.0, None
+
+    return float(frac), [int(cx1), int(cy1), int(cw), int(ch)]
+
+
 def image_angle_deg(p1, p2):
     dx = float(p2[0] - p1[0])
     dy = float(p2[1] - p1[1])
@@ -387,6 +417,14 @@ def main():
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--seed", type=int, default=0)
 
+    # tracking ground-truth output
+    parser.add_argument("--write-mot", action="store_true",
+                        help="Write MOTChallenge-style gt.txt and seqinfo.ini.")
+    parser.add_argument("--mot-class-id", type=int, default=1,
+                        help="Class id used in MOT gt. For single-class airplane tracking, use 1.")
+    parser.add_argument("--mot-min-visibility", type=float, default=0.05,
+                        help="Drop MOT boxes with visible fraction below this threshold.")
+
     parser.add_argument("--component-scores-json", default=None)
     parser.add_argument("--min-score", type=float, default=0.0)
     parser.add_argument("--min-area", type=int, default=80)
@@ -526,6 +564,13 @@ def main():
     save_json(out_dir / "assigned_objects.json", assign_summary)
 
     labels = []
+    mot_rows = []
+
+    # Map track names to stable integer IDs for tracking GT.
+    track_id_map = {
+        obj["track_name"]: i + 1
+        for i, obj in enumerate(assigned_objects)
+    }
 
     for fidx in range(args.num_frames):
         frame = bg.copy()
@@ -559,6 +604,7 @@ def main():
                 frame_labels.append({
                     "frame": fidx,
                     "track_name": obj["track_name"],
+                    "track_id": track_id_map[obj["track_name"]],
                     "prototype_component_id": obj["prototype_component_id"],
                     "bbox_xywh": bbox,
                     "center_xy": [float(pos[0]), float(pos[1])],
@@ -567,10 +613,49 @@ def main():
                     "cv2_rotation_angle_deg": float(cv2_rot_angle),
                 })
 
+                if args.write_mot:
+                    vis_frac, clipped_bbox = bbox_visible_fraction(bbox, W, H)
+                    if clipped_bbox is not None and vis_frac >= args.mot_min_visibility:
+                        # MOTChallenge gt format:
+                        # frame, id, bb_left, bb_top, bb_width, bb_height, conf, class, visibility
+                        # MOT frames are 1-indexed.
+                        x, y, bw, bh = clipped_bbox
+                        mot_rows.append([
+                            fidx + 1,
+                            track_id_map[obj["track_name"]],
+                            x,
+                            y,
+                            bw,
+                            bh,
+                            1,
+                            args.mot_class_id,
+                            round(float(vis_frac), 6),
+                        ])
+
         labels.extend(frame_labels)
         cv2.imwrite(str(frame_dir / f"frame_{fidx:04d}.png"), frame)
 
     save_json(out_dir / "labels.json", labels)
+
+    if args.write_mot:
+        mot_gt_dir = out_dir / "gt"
+        ensure_dir(mot_gt_dir)
+        mot_path = mot_gt_dir / "gt.txt"
+        with open(mot_path, "w") as f:
+            for row in mot_rows:
+                f.write(",".join(map(str, row)) + "\n")
+
+        seqinfo_path = out_dir / "seqinfo.ini"
+        seq_name = out_dir.name
+        with open(seqinfo_path, "w") as f:
+            f.write("[Sequence]\n")
+            f.write(f"name={seq_name}\n")
+            f.write("imDir=frames\n")
+            f.write(f"frameRate={args.fps}\n")
+            f.write(f"seqLength={args.num_frames}\n")
+            f.write(f"imWidth={W}\n")
+            f.write(f"imHeight={H}\n")
+            f.write("imExt=.png\n")
 
     video_path = out_dir / "simulation.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -584,6 +669,9 @@ def main():
     print(f"Saved extracted prototype summary to: {out_dir / 'prototype_summary.json'}")
     print(f"Saved assigned object summary to:    {out_dir / 'assigned_objects.json'}")
     print(f"Saved labels to:                    {out_dir / 'labels.json'}")
+    if args.write_mot:
+        print(f"Saved MOT gt to:                    {out_dir / 'gt' / 'gt.txt'}")
+        print(f"Saved MOT seqinfo to:               {out_dir / 'seqinfo.ini'}")
     print(f"Saved frames to:                    {frame_dir}")
     print(f"Saved video to:                     {video_path}")
     if args.debug_prototypes:
